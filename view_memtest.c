@@ -17,10 +17,17 @@
  * at 0x00000000 and DRAM at 0x08000000; bench.c adds 0x80000000 for a cached
  * access and 0xA0000000 for an uncached one.
  *
- * The two VRAM banks are not a separate device: they are the top 320 KiB of the
- * same 512 KiB static RAM, which is why the SRAM row and the VRAM rows usually
- * report the same numbers whenever the bank under test is not being scanned
- * out. That is worth seeing rather than hiding.
+ * boot.ld describes all 512 KiB as one SRAM, and the VRAM banks as two windows
+ * inside it. Measured on an A-19489, that is not how the board behaves: an
+ * uncached 64-bit read costs 45.8 cycles below 0x30000 and 8.0 cycles above it,
+ * a step the sweep page puts exactly on the bank boundary. The slow half also
+ * matches DRAM to three digits, so whatever sits below 0x30000 is on the same
+ * path as DRAM rather than on the video memory's.
+ *
+ * The fast region is one framebuffer per bank and no more -- 0x30000-0x557FF
+ * and 0x58000-0x7D7FF, 0x25800 bytes each, which is 320*240*2 exactly. A sweep
+ * window straddling either of those ends reads at the blend of the two rates.
+ * Keep the measured windows clear of the tails if that ever matters.
  */
 #define PHYS_SRAM 0x00000000u
 #define PHYS_VRAM0 0x00030000u
@@ -88,6 +95,34 @@ extern uint8_t _heap_size[];
 #define RESULT_PENDING 0u
 #define RESULT_SKIPPED 0xFFFFFFFFu
 
+/*
+ * The second page walks a small read window across the whole 512 KiB of SRAM to
+ * find out where its speed changes. It exists because the main page reports the
+ * low SRAM and the two VRAM banks at very different speeds, even though boot.ld
+ * describes them as one device: either there is a real boundary in there or the
+ * measurement is wrong, and 32 points either side of it settle which.
+ *
+ * Read only, deliberately. Reads are safe at any SRAM address -- including over
+ * .data, .bss and the stack -- whereas writes are not, and the uncached read is
+ * where the discrepancy showed up anyway.
+ */
+#define SWEEP_POINTS 32u
+#define SWEEP_STEP 0x4000u   // 16 KiB between points; 32 of them span 512 KiB
+#define SWEEP_WINDOW 0x2000u // 8 KiB read at each point
+
+#define SWEEP_GRAPH_LEFT 40
+#define SWEEP_GRAPH_PITCH 8
+#define SWEEP_BAR_WIDTH 6
+#define SWEEP_GRAPH_TOP 44
+#define SWEEP_GRAPH_BASE 180
+#define SWEEP_GRAPH_HEIGHT (SWEEP_GRAPH_BASE - SWEEP_GRAPH_TOP)
+
+#define ROW_SWEEP_TITLE 4
+#define ROW_SWEEP_SUB 16
+#define ROW_SWEEP_BANK 28
+#define ROW_SWEEP_ADDR 184
+#define ROW_SWEEP_STEP 194
+
 typedef struct
 {
     const char *name;
@@ -125,6 +160,7 @@ enum
     STEP_VSYNC = STEP_CPU + BENCH_CPU_COUNT,
     STEP_IDE_INIT,
     STEP_IDE_READ,
+    STEP_SWEEP,
     STEP_DONE,
 };
 
@@ -150,6 +186,10 @@ static uint32_t vsync_hz = RESULT_PENDING;
 static uint32_t ide_mbps = RESULT_PENDING;
 static bench_ide_status_t ide_status = BENCH_IDE_OK;
 static uint8_t step = 0;
+static uint8_t page = 0;
+
+static uint32_t sweep[SWEEP_POINTS];
+static uint32_t sweep_back_bank = 0;
 
 static bool exc_seen = false;
 static uint32_t exc_cause = 0;
@@ -207,6 +247,23 @@ static void measure_cpu(const bench_cpu_test_t test)
         // The headline instruction rate comes from the one kernel that issues
         // nothing but a single-cycle instruction.
         cpu_mips = bench_rate_x100(ops, ticks);
+    }
+}
+
+/*
+ * One frame, all 32 points, so that the whole sweep sees the same bank being
+ * scanned out. Splitting it across frames would swap the back buffer underneath
+ * the measurement and put a video-contention step in the middle of the graph
+ * that has nothing to do with the memory.
+ */
+static void measure_sweep(void)
+{
+    sweep_back_bank = BENCH_PHYS(gBackBuffer);
+
+    for (uint8_t i = 0; i < SWEEP_POINTS; i++)
+    {
+        const uint32_t base = (uint32_t)i * SWEEP_STEP;
+        sweep[i] = bench_rate_x100(SWEEP_WINDOW, bench_read(base, SWEEP_WINDOW, false));
     }
 }
 
@@ -314,10 +371,17 @@ static void run_step(void)
         return;
     }
 
-    if (ide_status == BENCH_IDE_OK)
+    if (step == STEP_IDE_READ)
     {
-        measure_ide();
+        if (ide_status == BENCH_IDE_OK)
+        {
+            measure_ide();
+        }
+        step++;
+        return;
     }
+
+    measure_sweep();
     step++;
 }
 
@@ -345,10 +409,9 @@ static void print_value_x100(const uint32_t value_x100)
     print_dec(frac);
 }
 
-static void print_result(const uint16_t x, const uint16_t y, const uint32_t value)
+// Prints at the current position, six characters wide whatever the value is.
+static void print_result_inline(const uint32_t value)
 {
-    set_xy(x, y);
-
     if (value == RESULT_PENDING)
     {
         set_text_color(COLOR_NOTE, 0xAAAA);
@@ -365,6 +428,12 @@ static void print_result(const uint16_t x, const uint16_t y, const uint32_t valu
 
     set_text_color(COLOR_VALUE, 0xAAAA);
     print_value_x100(value);
+}
+
+static void print_result(const uint16_t x, const uint16_t y, const uint32_t value)
+{
+    set_xy(x, y);
+    print_result_inline(value);
 }
 
 static const char *ide_status_str(void)
@@ -574,16 +643,135 @@ static void draw_notes(void)
     print_hex(exc_bad, 32);
 }
 
+/*
+ * A bar per point, coloured by which region the address falls in, so a step at
+ * a region boundary is obvious and a step anywhere else -- or none at all --
+ * is equally obvious. Reading exact figures off bars is hopeless, so the
+ * largest adjacent change is printed underneath in numbers.
+ */
+static void draw_sweep(void)
+{
+    set_text_color(COLOR_TITLE, 0xAAAA);
+    print_xy(88, ROW_SWEEP_TITLE, "SRAM UNCACHED READ SWEEP");
+
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(28, ROW_SWEEP_SUB, "8KiB window, 16KiB steps, uncached read only");
+
+    uint32_t max = 0;
+    for (uint8_t i = 0; i < SWEEP_POINTS; i++)
+    {
+        if (sweep[i] > max)
+        {
+            max = sweep[i];
+        }
+    }
+
+    if (max == 0)
+    {
+        print_xy(76, ROW_SWEEP_BANK, "Sweep has not run yet");
+        return;
+    }
+
+    set_xy(64, ROW_SWEEP_BANK);
+    print_str("Back buffer during sweep: ");
+    print_str(sweep_back_bank == PHYS_VRAM0 ? "VRAM0" : "VRAM1");
+
+    // Scale labels and baseline.
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_result(2, SWEEP_GRAPH_TOP, max);
+    print_xy(14, SWEEP_GRAPH_BASE - 8, "0.00");
+    draw_horizontal_line(SWEEP_GRAPH_LEFT, SWEEP_GRAPH_BASE, SWEEP_POINTS * SWEEP_GRAPH_PITCH, COLOR_RULE);
+
+    for (uint8_t i = 0; i < SWEEP_POINTS; i++)
+    {
+        if (sweep[i] == 0)
+        {
+            continue;
+        }
+
+        const uint32_t base = (uint32_t)i * SWEEP_STEP;
+        uint16_t height = (uint16_t)((sweep[i] * SWEEP_GRAPH_HEIGHT) / max);
+        if (height == 0)
+        {
+            height = 1;
+        }
+
+        uint16_t color = COLOR_VALUE;
+        if (base >= PHYS_VRAM1)
+        {
+            color = COLOR_TITLE;
+        }
+        else if (base >= PHYS_VRAM0)
+        {
+            color = COLOR_HEADER;
+        }
+
+        const uint16_t x = SWEEP_GRAPH_LEFT + (i * SWEEP_GRAPH_PITCH);
+        set_text_color(color, color);
+        draw_box(x, SWEEP_GRAPH_BASE - height, x + SWEEP_BAR_WIDTH - 1, SWEEP_GRAPH_BASE);
+    }
+
+    // Ticks and labels at the two VRAM bank boundaries.
+    set_text_color(COLOR_RULE, 0xAAAA);
+    draw_vertical_line(SWEEP_GRAPH_LEFT + ((PHYS_VRAM0 / SWEEP_STEP) * SWEEP_GRAPH_PITCH), SWEEP_GRAPH_BASE + 1, 3);
+    draw_vertical_line(SWEEP_GRAPH_LEFT + ((PHYS_VRAM1 / SWEEP_STEP) * SWEEP_GRAPH_PITCH), SWEEP_GRAPH_BASE + 1, 3);
+
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(SWEEP_GRAPH_LEFT, ROW_SWEEP_ADDR, "00000");
+    print_xy(SWEEP_GRAPH_LEFT + ((PHYS_VRAM0 / SWEEP_STEP) * SWEEP_GRAPH_PITCH), ROW_SWEEP_ADDR, "30000");
+    print_xy(SWEEP_GRAPH_LEFT + ((PHYS_VRAM1 / SWEEP_STEP) * SWEEP_GRAPH_PITCH), ROW_SWEEP_ADDR, "58000");
+    print_xy(264, ROW_SWEEP_ADDR, "7FFFF");
+
+    /*
+     * The largest change between neighbouring points, by ratio. That address is
+     * the boundary, if there is one. Starting the search at 1.5x rather than 1x
+     * means ordinary measurement scatter does not get reported as a step.
+     */
+    uint32_t worst_ratio = 150u;
+    uint8_t worst = 0;
+    for (uint8_t i = 1; i < SWEEP_POINTS; i++)
+    {
+        const uint32_t a = sweep[i - 1];
+        const uint32_t b = sweep[i];
+        if (a == 0 || b == 0)
+        {
+            continue;
+        }
+
+        const uint32_t ratio = (a > b) ? ((a * 100u) / b) : ((b * 100u) / a);
+        if (ratio > worst_ratio)
+        {
+            worst_ratio = ratio;
+            worst = i;
+        }
+    }
+
+    set_xy(2, ROW_SWEEP_STEP);
+    if (worst == 0)
+    {
+        print_str("No step found: flat across the whole 512 KiB");
+        return;
+    }
+
+    print_str("Step at ");
+    print_hex((uint32_t)worst * SWEEP_STEP, 24);
+    print_str(":");
+    print_result_inline(sweep[worst - 1]);
+    print_str(" ->");
+    print_result_inline(sweep[worst]);
+    print_str(" MB/s");
+}
+
 static void draw_status(void)
 {
     if (step >= STEP_DONE)
     {
         set_text_color(color_fade_in_out(0x03E0, 0x0, FADE_SPEED_2S), 0xAAAA);
-        print_xy(46, ROW_STATUS, "Press any button to run the tests again");
+        print_xy(37, ROW_STATUS, "Any button: other page   START: run again");
         return;
     }
 
-    const char *name = "IDE";
+    const char *name = "sweep";
     if (step < REGION_COUNT)
     {
         name = regions[step].name;
@@ -596,6 +784,10 @@ static void draw_status(void)
     {
         name = "vsync";
     }
+    else if (step < STEP_SWEEP)
+    {
+        name = "IDE";
+    }
 
     set_text_color(COLOR_HEADER, 0xAAAA);
     set_xy(88, ROW_STATUS);
@@ -605,26 +797,31 @@ static void draw_status(void)
 }
 
 /*
- * Held low when pressed, so an idle pad reads 0x7FF. Waiting for every button
- * to be released before arming stops the press that got here from immediately
- * restarting the run.
+ * Buttons are held low, so an idle pad reads 0x7FF. Returns the buttons that
+ * went down since the last call, from either player.
+ *
+ * The first call only records: whatever is already held when the view loads is
+ * not a press, and without that a stuck button would fire on frame one and keep
+ * firing.
  */
-static bool is_any_input_pressed(void)
+static uint16_t buttons_just_pressed(void)
 {
-    static uint8_t ready = 0;
+    static uint16_t previous = 0;
+    static bool primed = false;
 
-    if ((~gIO.player1 & 0x7FF) == 0 && (~gIO.player2 & 0x7FF) == 0)
+    const uint16_t current = (uint16_t)((~gIO.player1 & 0x7FF) | (~gIO.player2 & 0x7FF));
+
+    if (!primed)
     {
-        ready = 1;
+        previous = current;
+        primed = true;
+        return 0;
     }
 
-    if (ready == 1 && ((~gIO.player1 & 0x7FF) != 0 || (~gIO.player2 & 0x7FF) != 0))
-    {
-        ready = 0;
-        return true;
-    }
+    const uint16_t pressed = (uint16_t)(current & ~previous);
+    previous = current;
 
-    return false;
+    return pressed;
 }
 
 static void reset_results(void)
@@ -640,6 +837,11 @@ static void reset_results(void)
     for (uint8_t i = 0; i < BENCH_CPU_COUNT; i++)
     {
         cpu_cycles[i] = RESULT_PENDING;
+    }
+
+    for (uint8_t i = 0; i < SWEEP_POINTS; i++)
+    {
+        sweep[i] = RESULT_PENDING;
     }
 
     cpu_mips = RESULT_PENDING;
@@ -659,20 +861,34 @@ static void render(const uint64_t frame_count)
 
     video_clear_framebuffer(0x0);
 
-    draw_header();
-    draw_table();
-    draw_ide();
-    draw_cpu();
-    draw_notes();
+    if (page == 0)
+    {
+        draw_header();
+        draw_table();
+        draw_ide();
+        draw_cpu();
+        draw_notes();
+    }
+    else
+    {
+        draw_sweep();
+    }
+
     draw_status();
 
-    if (step >= STEP_DONE && is_any_input_pressed())
+    const uint16_t pressed = buttons_just_pressed();
+    if ((pressed & BTN_START) != 0)
     {
         // Clearing the fault report here and not in reset_results(): load()
         // calls that straight after capture_exception(), so clearing it there
         // would wipe the record before it was ever shown.
         exc_seen = false;
+        page = 0;
         reset_results();
+    }
+    else if (pressed != 0)
+    {
+        page ^= 1;
     }
 }
 

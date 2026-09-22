@@ -82,8 +82,9 @@ make memtest BOARD=20351     # A-20351, output/20351-memtest.u98
 make memtests                # both boards
 ```
 
-It boots straight into the test, runs once, and then waits for any P1/P2 input
-to run again. It never starts a game and never writes to the disk.
+It boots straight into the test and runs once. Any P1/P2 button switches
+between the two pages; P1/P2 START runs everything again. It never starts a
+game and never writes to the disk.
 
 | Region | Physical range      | Measured window                |
 | ------ | ------------------- | ------------------------------ |
@@ -108,10 +109,10 @@ Notes on what the numbers mean:
   heap. The bound is re-derived from the linker symbols at runtime, so if the
   heap ever grows past it the SRAM write test reports `skip` instead of
   corrupting the allocator.
-- The two VRAM banks are the top 320 KiB of the same 512 KiB static RAM as the
-  SRAM row, so they normally report the same speed. Each bank is measured only
-  while it is the back buffer, which keeps the picture clean and keeps video
-  refresh contention out of the figure.
+- The VRAM banks are **not** the same speed as the SRAM row, although `boot.ld`
+  describes all 512 KiB as one device. See the sweep section below. Each bank is
+  measured only while it is the back buffer, which keeps the picture clean and
+  keeps video refresh contention out of the figure.
 - The IDE figure covers a whole `READ SECTORS`, from the command write to the
   last byte, after an untimed warm-up read of the same sectors. With no drive
   fitted it reports `no drive / not ready` rather than hanging: every wait is
@@ -143,6 +144,47 @@ Unlike the memory kernels, the CPU kernels do **not** sweep the cache between
 passes: the loop has to run from the instruction cache and the load kernel has
 to hit in the data cache, otherwise the result is a memory measurement with a
 CPU label on it. The first pass warms both and the fastest of three is kept.
+
+### SRAM read sweep
+
+The second page walks an 8 KiB uncached read window across all 512 KiB of SRAM
+in 16 KiB steps and plots the result, one bar per point, coloured by region:
+white below VRAM bank 0, cyan for bank 0, yellow for bank 1. Underneath it
+prints the largest change between neighbouring points, which is the boundary
+address if there is one.
+
+It exists to settle a discrepancy on the first page: the low SRAM and the two
+VRAM banks report very different speeds even though `boot.ld` describes all of
+it as one 512 KiB device, and the low SRAM figures match DRAM to three digits.
+A clean step on a bank boundary would mean the split is real; a step anywhere
+else, or none, would mean the main page figures are not device speeds.
+
+Measured on an A-19489, the step is exactly at **0x30000**: 17.49 MB/s below it,
+99.68 MB/s above, with all twelve points below uniformly slow and both banks
+uniformly fast. The split is real, and the main page figures stand.
+
+Two further things fall out of the graph:
+
+- One point in each bank reads at roughly 46% of the bank's rate, both at bank
+  offset 0x24000 — that is 0x54000 and 0x7C000. An 8 KiB window there straddles
+  0x25800 bytes into the bank, which is 320×240×2 exactly. The blend of 0x1800
+  at the fast rate and 0x800 at the slow one works out to 45.9 MB/s, matching
+  the bar. **The fast memory is one framebuffer per bank and no more**:
+  0x30000–0x557FF and 0x58000–0x7D7FF. The tail of each bank is on the slow
+  path, as is everything below 0x30000.
+- The low SRAM matching DRAM to three digits is then not a coincidence: both
+  are on the same slow path, and only the two framebuffers are not.
+
+An uncached 64-bit read costs 45.8 cycles on the slow path against 8.0 on the
+fast one. What makes them differ — separate devices, bus width, wait states — is
+a board-level question this ROM cannot answer.
+
+The sweep is read only. Reads are safe at any SRAM address, including over
+`.data`, `.bss` and the stack, whereas writes are not — and the uncached read is
+where the discrepancy appears anyway. It runs entirely within one frame so the
+whole sweep sees the same bank being scanned out; the bank that was the back
+buffer is named on the page, since the other one carries video refresh
+contention.
 
 `Vsync (Hz)` is the one number here measured against something other than the
 CPU itself. The video timebase is its own crystal, so if the refresh rate comes

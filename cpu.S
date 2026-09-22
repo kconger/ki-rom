@@ -19,7 +19,7 @@
 # The raw instruction is the three-operand form with $zero as the destination,
 # `divu zero,t0,t1`, which is what GAS emits inside its own expansion. Getting
 # this wrong measures four instructions while claiming to measure one, and .set
-# nomacro only warns about it. Check the disassembly in output/*.txt after
+# nomacro only warns about it. Check the disassembly in output*.txt after
 # touching these loops.
 #
 # Loop shape, 64 operations plus two instructions of control per iteration:
