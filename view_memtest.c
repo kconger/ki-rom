@@ -17,17 +17,15 @@
  * at 0x00000000 and DRAM at 0x08000000; bench.c adds 0x80000000 for a cached
  * access and 0xA0000000 for an uncached one.
  *
- * boot.ld describes all 512 KiB as one SRAM, and the VRAM banks as two windows
- * inside it. Measured on an A-19489, that is not how the board behaves: an
- * uncached 64-bit read costs 45.8 cycles below 0x30000 and 8.0 cycles above it,
- * a step the sweep page puts exactly on the bank boundary. The slow half also
- * matches DRAM to three digits, so whatever sits below 0x30000 is on the same
- * path as DRAM rather than on the video memory's.
+ * boot.ld describes all 512 KiB as one SRAM with the VRAM banks as two windows
+ * inside it, so on that description every row here should report the same
+ * speed. Whether a given board or core agrees is what the sweep page exists to
+ * answer; nothing in this file assumes either way.
  *
- * The fast region is one framebuffer per bank and no more -- 0x30000-0x557FF
- * and 0x58000-0x7D7FF, 0x25800 bytes each, which is 320*240*2 exactly. A sweep
- * window straddling either of those ends reads at the blend of the two rates.
- * Keep the measured windows clear of the tails if that ever matters.
+ * Geometry worth knowing when reading a window: a visible framebuffer is
+ * 0x25800 bytes (320*240*2) while a bank spans 0x28000, so the last 0x2800 of
+ * each bank is never scanned out. A window straddling a boundary reports the
+ * blend of whatever rates lie either side of it.
  */
 #define PHYS_SRAM 0x00000000u
 #define PHYS_VRAM0 0x00030000u
