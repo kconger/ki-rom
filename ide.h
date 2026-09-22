@@ -62,4 +62,14 @@ uint8_t ide_init(void);
 void ide_read_sectors(uint32_t lba, uint32_t count, uint8_t *buf);
 void ide_write_sectors(uint32_t lba, uint32_t count, uint8_t *buf);
 
+/*
+ * Register level primitives. Neither of these waits for anything, which is why
+ * they are exposed: code that has to bound its own waiting (bench.c, which must
+ * stay under the watchdog period even with no drive fitted) can drive a
+ * transfer without inheriting the iteration-count timeouts in ide_wait_ready()
+ * and ide_ack().
+ */
+void ide_seek(uint32_t lba, uint8_t count);
+void ide_read_sector_bytes(uint16_t *ptr);
+
 #endif

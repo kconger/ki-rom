@@ -15,7 +15,11 @@
 #error "Please specify board type."
 #endif
 
-#if defined(KI_L15DI)
+#if defined(MEMTEST)
+// ROM=memtest: the standalone memory and IDE speed test, which embeds no game
+// image at all. Kept first so it wins however the build is invoked.
+#define KI_ROM_VERSION_STR "Memory & IDE Speed Test"
+#elif defined(KI_L15DI)
 #define KI_ROM_VERSION_STR "Killer Instinct l1.5di"
 #elif defined(KI_L15D)
 #define KI_ROM_VERSION_STR "Killer Instinct l1.5d"

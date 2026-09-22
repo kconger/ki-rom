@@ -70,6 +70,86 @@ When S1:7 dipswitch bit is turned on POST result will be kept on screen until an
 
 **NOTE: This has been moved to a dedicated board testing ROM**
 
+## Memory, CPU & IDE speed test ROM
+
+A standalone ROM that measures the throughput of every memory region, the CPU
+and the IDE interface, and puts the results on screen. It contains no game
+image, so it builds from a clean checkout with an empty `assets/roms`:
+
+```
+make memtest                 # A-19489, output/19489-memtest.u98
+make memtest BOARD=20351     # A-20351, output/20351-memtest.u98
+make memtests                # both boards
+```
+
+It boots straight into the test, runs once, and then waits for any P1/P2 input
+to run again. It never starts a game and never writes to the disk.
+
+| Region | Physical range      | Measured window                |
+| ------ | ------------------- | ------------------------------ |
+| SRAM   | 0x00000 - 0x2FFFF   | 0x14000 - 0x23FFF              |
+| VRAM 0 | 0x30000 - 0x57FFF   | 0x30000 - 0x3FFFF              |
+| VRAM 1 | 0x58000 - 0x7FFFF   | 0x58000 - 0x67FFF              |
+| DRAM   | 0x8000000 - 0x87FFFFF | 0x8000000 - 0x800FFFF        |
+| IDE    | LBA 0 - 127         | 64 KiB, read only              |
+
+Read and write are reported separately for cached (kseg0) and uncached (kseg1)
+access, in MB/s where MB is 10^6 bytes. Each figure is the fastest of three
+passes of 64 KiB of 64-bit accesses, with the primary data cache swept between
+passes so a cached pass always starts cold.
+
+Notes on what the numbers mean:
+
+- The measured window is 64 KiB for every region so the figures are directly
+  comparable. It is four times the 16K primary data cache, so a cached pass
+  reports memory bandwidth through the cache, not cache bandwidth.
+- SRAM is measured at 0x14000 rather than from 0x00000 because everything below
+  that is live: `.data`, `.bss`, the stack, the detour gateway stacks and the
+  heap. The bound is re-derived from the linker symbols at runtime, so if the
+  heap ever grows past it the SRAM write test reports `skip` instead of
+  corrupting the allocator.
+- The two VRAM banks are the top 320 KiB of the same 512 KiB static RAM as the
+  SRAM row, so they normally report the same speed. Each bank is measured only
+  while it is the back buffer, which keeps the picture clean and keeps video
+  refresh contention out of the figure.
+- The IDE figure covers a whole `READ SECTORS`, from the command write to the
+  last byte, after an untimed warm-up read of the same sectors. With no drive
+  fitted it reports `no drive / not ready` rather than hanging: every wait is
+  bounded by elapsed time, well inside the watchdog period.
+
+### CPU
+
+The CPU block reports pipeline cycles per operation, plus the instruction rate
+in MIPS taken from the ALU kernel:
+
+| Row          | Kernel                                    |
+| ------------ | ----------------------------------------- |
+| ALU addu     | dependent chain of `addu`                 |
+| Load lw (D$) | `lw` over 256 bytes, always a cache hit   |
+| Mul multu    | back to back `multu`                      |
+| Div divu     | back to back `divu`                       |
+| FPU add.s    | dependent chain of `add.s`                |
+| Vsync (Hz)   | video refresh rate, measured against Count |
+
+The kernels live in `cpu.S` rather than in C because the figure only means
+something if the instruction stream is exactly what the row claims it is, and
+`-Os` gives no way to pin that down from C. Each runs a loop of 64 operations
+plus two instructions of loop control, so every figure carries roughly 2 cycles
+of overhead per 64 operations: about 3% on a single-cycle instruction, and
+proportionally less on the slow ones. Cycles are `Count x 2`, since Count
+advances once per two pipeline cycles.
+
+Unlike the memory kernels, the CPU kernels do **not** sweep the cache between
+passes: the loop has to run from the instruction cache and the load kernel has
+to hit in the data cache, otherwise the result is a memory measurement with a
+CPU label on it. The first pass warms both and the fastest of three is kept.
+
+`Vsync (Hz)` is the one number here measured against something other than the
+CPU itself. The video timebase is its own crystal, so if the refresh rate comes
+out at the expected value the 50 MHz Count — and therefore the 100 MHz pipeline
+— is confirmed. A CPU clocked differently from the assumed 100 MHz shows up
+here as a refresh rate that is wrong by the same ratio.
+
 ## Patches
 
 | ROM version | I/O Remap          | A-20383 Bypass     | AnyIDE             | 2In1 HDD           | Reset              | No Music Fade out  | No Whiteblood      |

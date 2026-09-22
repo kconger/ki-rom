@@ -17,8 +17,24 @@ KI_ROM = $(shell echo $(ROM) | tr '[:lower:]' '[:upper:]' | tr '-' '_')
 KI_VARIANT = $(shell echo $(ROM) | cut -d'-' -f1 | tr '[:lower:]' '[:upper:]')
 
 ASM_SOURCES = start.S lzss.S images.S roms.S
-ASM_OBJS = $(ASM_SOURCES:%.S=build/${BOARD}-${ROM}-%.o)
 C_SOURCES = $(wildcard *.c libs/umm_malloc/*.c)
+
+# ROM=memtest builds the standalone memory and IDE speed test. It embeds no game
+# image, so it links neither roms.S nor the views, patches and assets that only
+# exist to operate on one -- which also makes it the one ROM that builds in a
+# checkout with an empty assets/roms.
+#
+# The selection happens here rather than with #ifdefs inside the sources so that
+# a normal ROM build compiles exactly the same translation units it did before,
+# and view_memtest.c/bench.c cost nothing in the ROMs that ship the game.
+ifeq (${ROM},memtest)
+ASM_SOURCES = start.S lzss.S cpu.S
+C_SOURCES := $(filter-out view_main.c view_bootselect.c patches.c patch_%.c assets.c,${C_SOURCES})
+else
+C_SOURCES := $(filter-out view_memtest.c bench.c,${C_SOURCES})
+endif
+
+ASM_OBJS = $(ASM_SOURCES:%.S=build/${BOARD}-${ROM}-%.o)
 C_OBJS = $(C_SOURCES:%.c=build/${BOARD}-${ROM}-%.o)
 DEPS = $(C_OBJS:.o=.d)
 
@@ -51,7 +67,13 @@ ROM_ADDR = $(ROM_BIN:.bin=.addr)
 ROM_ZBIN = $(ROM_BIN:.bin=.zbin)
 
 .PHONY: gamerom
+ifeq (${ROM},memtest)
+# Nothing to unpack or compress: the memory speed test ROM has no game image.
+# This is what lets `make memtest` run against an empty assets/roms.
+gamerom:
+else
 gamerom: ${ROM_ZBIN}
+endif
 
 # The order-only prerequisites on the asset and segment rules below exist for
 # the same reason as this one: `rom:` lists `tools` before the targets that
@@ -154,6 +176,17 @@ roms:
 	$(MAKE) rom BOARD=20351 ROM=ki2-l11
 	$(MAKE) rom BOARD=20351 ROM=ki2-l13
 	$(MAKE) rom BOARD=20351 ROM=ki2-l14
+
+# Memory and IDE speed test ROM. Needs no game image, so it builds from a clean
+# checkout: `make memtest` or `make memtest BOARD=20351`.
+.PHONY: memtest
+memtest:
+	$(MAKE) rom BOARD=${BOARD} ROM=memtest
+
+.PHONY: memtests
+memtests:
+	$(MAKE) rom BOARD=19489 ROM=memtest
+	$(MAKE) rom BOARD=20351 ROM=memtest
 
 .PHONY: hdd
 hdd:

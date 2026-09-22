@@ -12,7 +12,14 @@
 .org 0x0
 .globl _reset_exception_handler
 _reset_exception_handler:
+#if defined(MEMTEST)
+    # A reset is not an exception, and the watchdog arrives through this vector.
+    # It has to be told apart from a fault, or every watchdog reset comes back
+    # carrying whatever Cause and EPC happened to be left in CP0.
+    j _reset_handler
+#else
     j _exception_handler
+#endif
     nop
 
 # TLB Refill exception vector (0xbfc00200)
@@ -39,11 +46,59 @@ _other_exception_handler:
     j _exception_handler
     nop
 
+#if defined(MEMTEST)
+_reset_handler:
+    .set macro
+    # Clear any stale record, so that a restart arriving through the reset
+    # vector reports nothing at all. An empty report is itself the answer: it
+    # means the machine was reset (watchdog, NMI, power) rather than faulted.
+    lui k1,0xA002
+    ori k1,k1,0xF000
+    sw zero,0(k1)
+    j _restart
+    nop
+#endif
+
 _exception_handler:
     .set macro
+#if defined(MEMTEST)
+    # Record what went wrong before anything is reinitialised. The four real
+    # exception vectors land here and restart the ROM, so without this a fault
+    # inside one of the test kernels is indistinguishable from a watchdog reset:
+    # the screen simply starts over. k0/k1 are reserved for this kind of use.
+    #
+    # The record goes to UNCACHED SRAM at 0x2F000, which sits above everything
+    # the test writes (the SRAM window ends at 0x24000) and below VRAM bank 0.
+    # Uncached matters: init_data_cache below invalidates the data cache without
+    # writing it back, so a cached store here would be thrown away before
+    # view_memtest could read it.
+    lui k1,0xA002
+    ori k1,k1,0xF000
+    mfc0 k0,CP0_CAUSE
+    sw k0,4(k1)
+    mfc0 k0,CP0_EPC
+    sw k0,8(k1)
+    mfc0 k0,CP0_STATUS
+    sw k0,12(k1)
+    mfc0 k0,CP0_BAD_V_ADDR
+    sw k0,16(k1)
+    # Magic written last, so a record that was only half stored is never
+    # mistaken for a real one.
+    lui k0,0xDEAD
+    ori k0,k0,0xBEEF
+    sw k0,0(k1)
+
+_restart:
+#endif
     li v0,0x0
     mtc0 v0,CP0_COUNT
+#if defined(MEMTEST)
+    # ROM=memtest links neither view_main nor the patches, and boots straight
+    # into the memory and IDE speed test instead of into the game.
+    la a0,view_memtest
+#else
     la a0,view_main
+#endif
     j _reset
     nop
 

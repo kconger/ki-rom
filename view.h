@@ -22,6 +22,7 @@ typedef struct
 
 extern view_t view_main;
 extern view_t view_bootselect;
+extern view_t view_memtest;
 extern view_t *view_current;
 
 void view_switch(view_t *view);
