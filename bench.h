@@ -8,6 +8,7 @@
 #define _BENCH_H_
 
 #include <stdint.h>
+#include "cache.h"
 
 /*
  * Throughput measurement kernels for the memory regions and the IDE interface.
@@ -85,10 +86,12 @@ uint32_t bench_cycles_x100(uint32_t ops, uint32_t ticks);
 typedef enum
 {
     BENCH_CPU_ALU = 0,  // addu, dependent chain
-    BENCH_CPU_LOAD,     // lw, data cache hit
+    BENCH_CPU_LOAD,     // lw, data cache hit, all 64 into one register
     BENCH_CPU_MUL,      // multu
     BENCH_CPU_DIV,      // divu
     BENCH_CPU_FPU,      // add.s, dependent chain
+    BENCH_CPU_LOAD_8,   // lw, data cache hit, eight registers in rotation
+    BENCH_CPU_LOAD_DEP, // lw, data cache hit, each result the next address
     BENCH_CPU_COUNT,
 } bench_cpu_test_t;
 
@@ -109,6 +112,53 @@ uint32_t bench_vsync_ticks(uint32_t frames);
 
 // Frequency in hundredths of a Hz for something that takes `ticks` per period.
 uint32_t bench_hz_x100(uint32_t ticks);
+
+/*
+ * Latency, where everything above is throughput.
+ *
+ * bench_read() sweeps a window in address order, so the data cache's next-line
+ * read-ahead has a line in flight before the CPU asks for it and several misses
+ * overlap: the figure it reports is how many bytes per second the machine can
+ * keep moving, not what one miss costs. The SDRAM work is aimed at the second
+ * number, and nothing here measured it.
+ *
+ * A pointer chase does. Node n holds the address of node n+1, so the address of
+ * one load is the result of the one before it, no read-ahead has anything to
+ * predict from, and a blocking primary cache leaves exactly one miss in flight.
+ * Divide the elapsed cycles by the number of steps and that is what a miss costs
+ * end to end, which is the figure the optimisation is being argued from.
+ *
+ * bench_chase_build() writes the chain and then WALKS it, in C and with every
+ * pointer bounds-checked, before mem_bench_chase() is ever pointed at it. It
+ * returns false if the walk is not one cycle of exactly the expected length --
+ * see the note above chase_verify() in bench.c for why that check is not
+ * optional. `nodes` must be a multiple of BENCH_CPU_OPS_PER_ITER, and a power of
+ * two as well when `shuffle` is set.
+ *
+ * bench_chase_build_pair() lays down a chain that alternates between two bases
+ * on every single step, for pricing what the SDRAM controller pays to move
+ * between two rows. The step count is 2 * `nodes`.
+ */
+bool bench_chase_build(uint32_t phys, uint32_t nodes, uint32_t stride, bool shuffle);
+bool bench_chase_build_pair(uint32_t phys_a, uint32_t phys_b, uint32_t nodes);
+
+// Fastest of BENCH_PASSES walks of `steps` dependent loads, in ticks. The cache
+// is swept before every pass, so `steps` must be one lap and no more: a second
+// lap over a chain that fits would find nodes still resident and report a blend
+// of a miss and a hit.
+uint32_t bench_chase_run(uint32_t phys, uint32_t steps);
+
+/*
+ * Store streams that differ only in how much of each 32-byte line they write:
+ * `whole_line` writes all four doublewords, otherwise one. Both are cached, both
+ * touch size / CACHE_LINE_SIZE lines, and both start with a swept cache, so the
+ * caller can divide either result by that same line count and compare.
+ *
+ * The core claims a "skip fill" that drops the read of a line the CPU is about
+ * to overwrite completely. If it is working, the whole-line stream costs one
+ * SDRAM transfer per line where the single-doubleword stream costs two.
+ */
+uint32_t bench_write_lines(uint32_t phys, uint32_t size, bool whole_line);
 
 typedef enum
 {

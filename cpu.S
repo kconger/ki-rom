@@ -44,9 +44,10 @@
 # overhead per 64 operations -- roughly 3% on a single-cycle instruction, and
 # proportionally less on the slow ones.
 #
-# a1 is the base address for cpu_bench_load(), which bench.c points at a 256
-# byte cache-line-aligned buffer. The other kernels ignore it, so that bench.c
-# can call all of them through one function pointer type.
+# a1 is a base address, for the kernels that take one: cpu_bench_load() and
+# cpu_bench_load_indep() read 256 bytes from it, and mem_bench_chase() treats it
+# as the head of a linked chain. The rest ignore it, so that bench.c can call
+# all of them through one function pointer type.
 #
 # All of t0-t3 ($8-$11) are scratch under o64: the first four arguments arrive
 # in a0-a3 and these kernels take two, so nothing live is being trampled. No
@@ -91,6 +92,89 @@ cpu_bench_load:
     .rept 64
     lw t0,lwoff(a1)
     .set lwoff,lwoff+4
+    .endr
+    bnez a0,1b
+    addiu a0,a0,-1
+
+    jr ra
+    nop
+
+# Load from the primary data cache, into EIGHT destinations in rotation instead
+# of one. Same 64 loads over the same 256 bytes as cpu_bench_load above, and the
+# results are just as dead; the only difference is that no load overwrites the
+# register the one before it wrote.
+#
+# This pair exists to settle a number. cpu_bench_load reports about 2.0 cycles
+# per load on the core while cpu_bench_alu reports 1.0, and a scalar R4600
+# pipelines the data cache well enough to retire one hitting load per cycle. So
+# either the write-after-write on t0 is being treated as a real dependency, in
+# which case THIS kernel comes out near 1.0, or the core pays the second cycle
+# on every load whatever its destination, in which case this one reports 2.0 as
+# well and the cost is in the load path itself.
+#
+# t0-t7 are $8-$15. Under o64 the first EIGHT arguments arrive in $4-$11, so
+# t0-t3 are also a4-a7 -- but this kernel is called with two arguments, so all
+# of $8-$15 are dead on entry and caller-saved on exit either way.
+.balign 4
+.globl cpu_bench_load_indep
+cpu_bench_load_indep:
+    addiu a0,a0,-1
+1:
+    .set lwoff,0
+    .rept 8
+    lw t0,lwoff(a1)
+    .set lwoff,lwoff+4
+    lw t1,lwoff(a1)
+    .set lwoff,lwoff+4
+    lw t2,lwoff(a1)
+    .set lwoff,lwoff+4
+    lw t3,lwoff(a1)
+    .set lwoff,lwoff+4
+    lw t4,lwoff(a1)
+    .set lwoff,lwoff+4
+    lw t5,lwoff(a1)
+    .set lwoff,lwoff+4
+    lw t6,lwoff(a1)
+    .set lwoff,lwoff+4
+    lw t7,lwoff(a1)
+    .set lwoff,lwoff+4
+    .endr
+    bnez a0,1b
+    addiu a0,a0,-1
+
+    jr ra
+    nop
+
+# Dependent load chain -- the pointer chase, and the one kernel here that is not
+# only a CPU test. Each node holds the address of the next in its first word, so
+# the address of load n+1 IS the result of load n. Nothing in the machine can
+# overlap two of them: there is no address for the data cache's next-line
+# read-ahead to predict, and the R4600's primary cache blocks, so exactly one
+# miss is ever outstanding. What comes back is the round trip of a single miss.
+#
+# bench.c aims it at two different chains. Over a chain in DRAM that is several
+# times the size of the data cache, every step misses and this reports SDRAM
+# miss latency -- where bench_read() reports how many misses per second the
+# machine can keep in flight, which is a different question and a much kinder
+# one. Over a 256 byte chain that stays in the cache, every step hits and this
+# reports load-use latency, the third of the three load variants above.
+#
+# bench.c builds the chain AND proves it is a single cycle of the expected
+# length before calling this. It has to: nothing below bounds where a pointer
+# leads, so one word DRAM did not return correctly walks to an arbitrary
+# address, and the first unaligned or unmapped one takes an exception -- which
+# on this ROM is a silent restart, not a message.
+#
+# lw sign-extends its result, and init_cpu leaves Status.KX/SX/UX clear, so the
+# 32-bit kseg0 address stored in the node is used as a 32-bit address. Nothing
+# here needs ld, and the chain stays half the size for it.
+.balign 4
+.globl mem_bench_chase
+mem_bench_chase:
+    addiu a0,a0,-1
+1:
+    .rept 64
+    lw a1,0(a1)
     .endr
     bnez a0,1b
     addiu a0,a0,-1
