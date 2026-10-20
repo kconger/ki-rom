@@ -251,3 +251,215 @@ cpu_bench_fpu:
 
     jr ra
     nop
+
+# Sprite blend: one run-length coded sprite added into the framebuffer, each
+# 5-bit channel saturating, the way KI2 draws its explosions. bench.c times a
+# frame's worth of these (bench_blend_run) - see the note there for the frame.
+#
+# a0 points at a bench_blend_blit_t, nine words:
+#    0  rle      the sprite's rows, in the order they are drawn
+#    4  dst      the first row's origin pixel: runs start there and go right,
+#                or left when mirrored
+#    8  pitch    bytes from one row's origin to the next's (negative: upwards)
+#   12  rows     at least 1
+#   16  mirror   0: runs go right, otherwise left
+#   20  clip_lo  the first row's window, [clip_lo, clip_hi), byte addresses;
+#   24  clip_hi  it moves by pitch with the rows
+#   28  palette  32 RGB555 halfwords
+#   32  scale    destination pixels per source pixel, 20.12 fixed point
+#
+# A row is a byte count and then that many bytes of items. An item is a run
+# byte - colour index in bits 7:3, length - 1 in bits 2:0, never zero - or a
+# zero byte and then a transparent gap's length. Lengths are in source pixels:
+# each is multiplied by scale, the integer part is drawn (or skipped) and the
+# fraction carries to the next item in the row.
+#
+# The add is the usual packed one. The sum's carries out of the three fields
+# (0x8420) become a mask of each overflowed field's five bits, which is ORed
+# over the sum; a carry still reaches the next field's lowest bit, as in the
+# game. 11 instructions a pixel: a halfword load, the add, a halfword store in
+# the branch delay slot, so each pixel's store is followed by the next pixel's
+# load from the same doubleword three times in four.
+#
+# Uses s0-s3, so unlike the throughput kernels it saves them (o64: 64-bit).
+.balign 4
+.globl mem_bench_blend
+mem_bench_blend:
+    daddiu sp,sp,-32
+    sd s0,0(sp)
+    sd s1,8(sp)
+    sd s2,16(sp)
+    sd s3,24(sp)
+    lw v1,0(a0)                 # rle
+    lw s1,4(a0)                 # this row's origin
+    lw s2,8(a0)                 # pitch
+    lw s0,12(a0)                # rows left
+    lw t0,16(a0)                # mirror
+    lw a2,20(a0)                # window
+    lw a3,24(a0)
+    lw t6,28(a0)                # palette
+    lw t5,32(a0)                # scale
+    bne t0,zero,blend_left
+    ori t4,zero,0x8420          # delay slot: the carry out of each field
+
+blend_right_row:
+    lbu t0,0(v1)                # the row's byte count
+    addiu v1,v1,1
+    addu a1,v1,t0               # where its items end
+    or v0,s1,zero
+    addu s1,s1,s2
+    beq v1,a1,blend_right_next_row
+    or t7,zero,zero             # delay slot: no fraction carried into a row
+blend_right_item:
+    lbu t0,0(v1)
+    addiu v1,v1,1
+    beq t0,zero,blend_right_gap
+    andi t1,t0,7                # delay slot: length - 1, if a run
+    mult t1,t5
+    srl t0,t0,3
+    sll t0,t0,1
+    addu t0,t6,t0
+    lh t9,0(t0)                 # the run's colour
+    addu t7,t7,t5               # the + 1 of the length, scaled
+    mflo t1
+    addu t7,t7,t1
+    srl t1,t7,12                # destination pixels
+    andi t7,t7,0xfff
+    beq t1,zero,blend_right_next_item
+    sll t1,t1,1                 # delay slot: in bytes
+    addu t8,v0,t1               # the run's end
+    or s3,t8,zero               # where the next item starts, clipped or not
+    slt at,a2,t8
+    beq at,zero,blend_right_skip    # wholly left of the window
+    slt at,v0,a2                # delay slot
+    beq at,zero,1f
+    slt t1,a3,t8                # delay slot
+    or v0,a2,zero               # clip the start
+1:  beq t1,zero,2f
+    nop
+    or t8,a3,zero               # clip the end
+2:  slt at,v0,t8
+    beq at,zero,blend_right_skip    # nothing left inside it
+    nop
+3:  lh t0,0(v0)
+    addiu v0,v0,2
+    addu t1,t0,t9
+    xor t2,t0,t9
+    xor t2,t2,t1                # the carry into every bit
+    and t2,t2,t4                # those out of each field
+    srl t3,t2,5
+    subu t2,t2,t3               # each overflowed field, all ones
+    or t1,t1,t2
+    bne v0,t8,3b
+    sh t1,-2(v0)
+blend_right_skip:
+    or v0,s3,zero
+blend_right_next_item:
+    bne v1,a1,blend_right_item
+    nop
+blend_right_next_row:
+    addiu s0,s0,-1
+    addu a2,a2,s2
+    bne s0,zero,blend_right_row
+    addu a3,a3,s2
+    beq zero,zero,blend_done
+    nop
+blend_right_gap:
+    lbu t1,0(v1)
+    addiu v1,v1,1
+    mult t1,t5
+    mflo t1
+    addu t7,t7,t1
+    srl t1,t7,12
+    andi t7,t7,0xfff
+    sll t1,t1,1
+    beq zero,zero,blend_right_next_item
+    addu v0,v0,t1
+
+# Leftwards. A run covers v0, v0 - 2 ... t8 + 2, so the window is held two
+# bytes low: a2 is then the lowest end a run may have and a3 the highest
+# start, and the tests mirror the rightward ones.
+blend_left:
+    addiu a2,a2,-2
+    addiu a3,a3,-2
+blend_left_row:
+    lbu t0,0(v1)
+    addiu v1,v1,1
+    addu a1,v1,t0
+    or v0,s1,zero
+    addu s1,s1,s2
+    beq v1,a1,blend_left_next_row
+    or t7,zero,zero
+blend_left_item:
+    lbu t0,0(v1)
+    addiu v1,v1,1
+    beq t0,zero,blend_left_gap
+    andi t1,t0,7
+    mult t1,t5
+    srl t0,t0,3
+    sll t0,t0,1
+    addu t0,t6,t0
+    lh t9,0(t0)
+    addu t7,t7,t5
+    mflo t1
+    addu t7,t7,t1
+    srl t1,t7,12
+    andi t7,t7,0xfff
+    beq t1,zero,blend_left_next_item
+    sll t1,t1,1
+    subu t8,v0,t1
+    or s3,t8,zero
+    slt at,a2,v0
+    beq at,zero,blend_left_skip     # wholly left of the window
+    slt at,a3,v0                # delay slot
+    beq at,zero,1f
+    slt t1,t8,a2                # delay slot
+    or v0,a3,zero               # clip the start
+1:  beq t1,zero,2f
+    nop
+    or t8,a2,zero               # clip the end
+2:  slt at,t8,v0
+    beq at,zero,blend_left_skip     # nothing left inside it
+    nop
+3:  lh t0,0(v0)
+    addiu v0,v0,-2
+    addu t1,t0,t9
+    xor t2,t0,t9
+    xor t2,t2,t1
+    and t2,t2,t4
+    srl t3,t2,5
+    subu t2,t2,t3
+    or t1,t1,t2
+    bne v0,t8,3b
+    sh t1,2(v0)
+blend_left_skip:
+    or v0,s3,zero
+blend_left_next_item:
+    bne v1,a1,blend_left_item
+    nop
+blend_left_next_row:
+    addiu s0,s0,-1
+    addu a2,a2,s2
+    bne s0,zero,blend_left_row
+    addu a3,a3,s2
+    beq zero,zero,blend_done
+    nop
+blend_left_gap:
+    lbu t1,0(v1)
+    addiu v1,v1,1
+    mult t1,t5
+    mflo t1
+    addu t7,t7,t1
+    srl t1,t7,12
+    andi t7,t7,0xfff
+    sll t1,t1,1
+    beq zero,zero,blend_left_next_item
+    subu v0,v0,t1
+
+blend_done:
+    ld s0,0(sp)
+    ld s1,8(sp)
+    ld s2,16(sp)
+    ld s3,24(sp)
+    jr ra
+    daddiu sp,sp,32

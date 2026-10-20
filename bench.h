@@ -171,4 +171,47 @@ typedef enum
 bench_ide_status_t bench_ide_init(void);
 bench_ide_status_t bench_ide_read(uint32_t lba, uint32_t sectors, uint32_t dst_phys, uint32_t *ticks);
 
+/*
+ * A heavy game frame, as memory traffic: the sprite blend of KI2's barrel
+ * explosion on Orchid's stage, its slowest frame. Ten sprites in the order the
+ * game draws them - two that cover the whole screen, one drawn each way, and
+ * eight smaller ones - each run-length coded, each pixel read from the back
+ * buffer, added with per-channel saturation and written back. The game's own
+ * frame does exactly this for 65-77% of its work; the rest (its logic and
+ * background decompression) is not reproduced.
+ *
+ * bench_blend_build() generates the sprites from a fixed seed into DRAM at
+ * `phys`, so every board and core blends identical data; false if a row would
+ * not fit its one-byte count. bench_blend_run() then times the frame into the
+ * back buffer at `bank_phys`, fastest of BENCH_PASSES, each pass from a cold
+ * data cache over the same background, and checksums the bank afterwards: two
+ * machines that agree on the checksum blended the same pixels.
+ */
+#define BENCH_BLEND_BLITS 10u
+
+// The layout mem_bench_blend() reads; see cpu.S.
+typedef struct
+{
+    uint32_t rle;
+    uint32_t dst;
+    int32_t pitch;
+    uint32_t rows;
+    uint32_t mirror;
+    uint32_t clip_lo;
+    uint32_t clip_hi;
+    uint32_t palette;
+    uint32_t scale;
+} bench_blend_blit_t;
+
+typedef struct
+{
+    uint32_t pixels[BENCH_BLEND_BLITS]; // pixels each sprite blends
+    uint32_t ticks[BENCH_BLEND_BLITS];  // each sprite's ticks in the fastest pass
+    uint32_t frame_ticks;               // the fastest pass, all ten
+    uint32_t checksum;
+} bench_blend_result_t;
+
+bool bench_blend_build(uint32_t phys);
+void bench_blend_run(uint32_t bank_phys, bench_blend_result_t *result);
+
 #endif

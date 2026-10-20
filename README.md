@@ -82,8 +82,8 @@ make memtest BOARD=20351     # A-20351, output/20351-memtest.u98
 make memtests                # both boards
 ```
 
-It boots straight into the test and runs once. Any P1/P2 button switches
-between the two pages; P1/P2 START runs everything again. It never starts a
+It boots straight into the test and runs once. Any P1/P2 button steps through
+the pages; P1/P2 START runs everything again. It never starts a
 game and never writes to the disk.
 
 | Region | Physical range      | Measured window                |
@@ -167,6 +167,27 @@ CPU itself. The video timebase is its own crystal, so if the refresh rate comes
 out at the expected value the 50 MHz Count — and therefore the 100 MHz pipeline
 — is confirmed. A CPU clocked differently from the assumed 100 MHz shows up
 here as a refresh rate that is wrong by the same ratio.
+
+### Heavy frame
+
+The last page times a heavy game frame's memory traffic: the sprite blend of
+Killer Instinct 2's slowest frame in the barrel explosions on Orchid's stage,
+three vblanks on the real game. Ten sprites in the order the game draws them -
+two covering the whole screen, one drawn rightwards and one leftwards, and
+eight smaller ones - each run-length coded in DRAM and added into the back
+buffer one pixel at a time: a halfword load, a per-channel saturating add, a
+halfword store. Each sprite's box, run lengths, direction and coverage are the
+game's; the pixels are generated from a fixed seed, so every board and core
+blends identical data. 175,445 pixels, 3.21 million instructions.
+
+Each row is one sprite: its pixels, cycles per pixel and thousands of cycles.
+The frame row is all ten, fastest of three passes, each from a cold data cache
+over the same background; underneath it the frame in vblanks at the measured
+refresh rate, and a checksum of the bank afterwards. Two machines that print
+the same checksum blended the same pixels (`0x727B3D0B`).
+
+The blend is 65-77% of the game's frame; its logic and background
+decompression are not reproduced.
 
 ## Patches
 
