@@ -8,6 +8,7 @@
 #include "cache.h"
 #include "delay.h"
 #include "ide.h"
+#include "rand.h"
 #include "video.h"
 #include "wdt.h"
 
@@ -662,4 +663,225 @@ bench_ide_status_t bench_ide_read(uint32_t lba, uint32_t sectors, uint32_t dst_p
 
     *ticks = cp0_elapsed(start);
     return BENCH_IDE_OK;
+}
+
+/*
+ * The heavy frame (see bench.h). The ten sprites below are the ten blends of
+ * KI2's slowest barrel-explosion frame, measured in MAME (the core's
+ * tools/mame_ki2_fps.lua fight, frame 17,293): each one's box, the direction
+ * its runs go, how long they are and how much of the box they cover. The
+ * generator reproduces those, not the game's pixels:
+ *
+ *   box                  runs  game: pixels   runs   these: pixels   runs
+ *   312x240 rightwards   1-8           73,071  15,829          73,625  16,554
+ *    34x36  leftwards    1-2            1,041     820           1,060     721
+ *   146x112 leftwards    1-5            7,384   2,541           7,151   2,408
+ *   312x240 leftwards    5-8           69,906  10,572          69,787  10,840
+ *    63x43  rightwards   1              1,027     970           1,025   1,025
+ *    56x52  rightwards   1-2            1,698   1,223           1,732   1,167
+ *    81x90  leftwards    1-4            4,791   2,089           4,705   1,901
+ *   184x137 leftwards    3-8           15,818   2,973          15,808   2,914
+ *    20x24, 19x25 rightwards 1           540     461             552     552
+ *   the frame                         175,276  37,478         175,445  38,082
+ *
+ * 3.21 million instructions, 18.3 a pixel: 11 in the blend loop, the rest a
+ * run's decode, scale and clip tests and the rows'. The game's own blitter
+ * runs about 17.4 a pixel over its biggest sprite.
+ *
+ * In the game the frame's two big sprites are wider than the screen and
+ * clipped to it; here every sprite fits, so the clip tests run and never
+ * trim. Rows are drawn bottom up and the scale is 1.0, both as in the game's
+ * frame; the scale multiply still runs on every run and gap.
+ *
+ * Gaps are drawn with a fixed chance before each run, sized so the sprite
+ * covers the game's share of its box.
+ */
+typedef struct
+{
+    uint16_t x, y, w, h; // pixels from the bank's origin; y is the top row
+    uint8_t mirror;
+    uint8_t run_lo, run_hi; // source run length, uniform
+    uint8_t gap_pct;        // chance of a transparent gap before a run
+    uint8_t gap_lo, gap_hi; // and its length
+} blend_spec_t;
+
+static const blend_spec_t blend_specs[BENCH_BLEND_BLITS] = {
+    {0, 0, 312, 240, 0, 1, 8, 2, 2, 6},
+    {114, 122, 34, 36, 1, 1, 2, 12, 1, 3},
+    {35, 64, 146, 112, 1, 1, 5, 46, 4, 12},
+    {0, 0, 312, 240, 1, 5, 8, 12, 2, 6},
+    {6, 151, 63, 43, 0, 1, 1, 41, 2, 6},
+    {52, 92, 56, 52, 0, 1, 2, 27, 2, 6},
+    {46, 74, 81, 90, 1, 1, 4, 34, 2, 6},
+    {0, 103, 184, 137, 1, 3, 8, 40, 4, 12},
+    {140, 3, 20, 24, 0, 1, 1, 39, 1, 3},
+    {156, 2, 19, 25, 0, 1, 1, 33, 1, 3},
+};
+
+#define BLEND_PITCH 640u      // bytes from one framebuffer row to the next
+#define BLEND_CLIP_WIDTH 312u // the game's window: the visible width it draws to
+#define BLEND_SCALE 0x1000u   // 1.0 in 20.12
+#define BLEND_SEED 0x4B493221u
+
+static uint32_t blend_rle[BENCH_BLEND_BLITS]; // kseg0 address of each sprite's rows
+static uint32_t blend_pixels[BENCH_BLEND_BLITS];
+static uint32_t blend_palette;
+static bench_blend_blit_t blend_blits[BENCH_BLEND_BLITS];
+
+static inline uint32_t blend_rand(const uint32_t lo, const uint32_t hi)
+{
+    return lo + (rand() % (hi - lo + 1u));
+}
+
+bool bench_blend_build(uint32_t phys)
+{
+    uint8_t *out = (uint8_t *)(uintptr_t)(BENCH_KSEG0 + phys);
+
+    srand(BLEND_SEED);
+
+    // 32 colours of 0-15 per channel, so a sum saturates where the background
+    // is bright and not where it is dark.
+    uint16_t *const palette = (uint16_t *)out;
+    for (uint32_t i = 0; i < 32u; i++)
+    {
+        palette[i] = (uint16_t)(rand() & 0x3DEFu);
+    }
+    blend_palette = (uint32_t)(uintptr_t)palette;
+    out += 64;
+
+    for (uint32_t b = 0; b < BENCH_BLEND_BLITS; b++)
+    {
+        const blend_spec_t *const spec = &blend_specs[b];
+        uint32_t pixels = 0;
+
+        blend_rle[b] = (uint32_t)(uintptr_t)out;
+
+        for (uint32_t row = 0; row < spec->h; row++)
+        {
+            uint8_t *const count = out++;
+            uint32_t left = spec->w;
+
+            while (left != 0u)
+            {
+                if ((rand() % 100u) < spec->gap_pct)
+                {
+                    uint32_t n = blend_rand(spec->gap_lo, spec->gap_hi);
+                    n = n < left ? n : left;
+                    *out++ = 0;
+                    *out++ = (uint8_t)n;
+                    left -= n;
+                    if (left == 0u)
+                    {
+                        break;
+                    }
+                }
+
+                uint32_t n = blend_rand(spec->run_lo, spec->run_hi);
+                n = n < left ? n : left;
+                *out++ = (uint8_t)((blend_rand(1, 31) << 3) | (n - 1u));
+                pixels += n;
+                left -= n;
+            }
+
+            const uint32_t bytes = (uint32_t)(out - count) - 1u;
+            if (bytes > 255u)
+            {
+                return false;
+            }
+            *count = (uint8_t)bytes;
+        }
+
+        blend_pixels[b] = pixels;
+    }
+
+    // The sprites are read through the cache like any other data; get them
+    // out to DRAM before anything throws the cache away.
+    dcache_writeback_invalidate();
+    return true;
+}
+
+/*
+ * The background every pass blends over: a pattern with each channel running
+ * 0-31 across the page, written through the cache and then written back, so
+ * the pass starts with the bank in memory and none of it cached.
+ */
+static void blend_background(const uint32_t bank_phys)
+{
+    volatile uint16_t *const bank = (volatile uint16_t *)(uintptr_t)(BENCH_KSEG0 + bank_phys);
+
+    for (uint32_t y = 0; y < 240u; y++)
+    {
+        for (uint32_t x = 0; x < 320u; x++)
+        {
+            bank[(y * 320u) + x] = (uint16_t)(((x >> 1) & 31u) | (((y >> 1) & 31u) << 5) | ((((x + y) >> 2) & 31u) << 10));
+        }
+    }
+    dcache_writeback_invalidate();
+}
+
+extern void mem_bench_blend(const bench_blend_blit_t *blit);
+
+void bench_blend_run(uint32_t bank_phys, bench_blend_result_t *result)
+{
+    const uint32_t bank = BENCH_KSEG0 + bank_phys;
+
+    for (uint32_t b = 0; b < BENCH_BLEND_BLITS; b++)
+    {
+        const blend_spec_t *const spec = &blend_specs[b];
+        const uint32_t bottom = bank + ((uint32_t)(spec->y + spec->h - 1u) * BLEND_PITCH);
+        bench_blend_blit_t *const blit = &blend_blits[b];
+
+        blit->rle = blend_rle[b];
+        blit->dst = bottom + (2u * (spec->mirror ? (uint32_t)(spec->x + spec->w - 1u) : spec->x));
+        blit->pitch = -(int32_t)BLEND_PITCH;
+        blit->rows = spec->h;
+        blit->mirror = spec->mirror;
+        blit->clip_lo = bottom;
+        blit->clip_hi = bottom + (2u * BLEND_CLIP_WIDTH);
+        blit->palette = blend_palette;
+        blit->scale = BLEND_SCALE;
+
+        result->pixels[b] = blend_pixels[b];
+    }
+
+    uint32_t best = 0xFFFFFFFFu;
+
+    for (uint32_t pass = 0; pass < BENCH_PASSES; pass++)
+    {
+        uint32_t ticks[BENCH_BLEND_BLITS];
+
+        wdt_reset();
+        blend_background(bank_phys);
+
+        const uint32_t start = cp0_count();
+        for (uint32_t b = 0; b < BENCH_BLEND_BLITS; b++)
+        {
+            const uint32_t blit_start = cp0_count();
+            mem_bench_blend(&blend_blits[b]);
+            ticks[b] = cp0_elapsed(blit_start);
+        }
+        const uint32_t elapsed = cp0_elapsed(start);
+
+        if (elapsed < best)
+        {
+            best = elapsed;
+            for (uint32_t b = 0; b < BENCH_BLEND_BLITS; b++)
+            {
+                result->ticks[b] = ticks[b];
+            }
+        }
+    }
+
+    result->frame_ticks = best;
+
+    // Every pass blends the same pixels over the same background, so the bank
+    // as the last pass left it is every pass's result. Read through the cache:
+    // the last of it is still dirty there.
+    const volatile uint32_t *const words = (const volatile uint32_t *)(uintptr_t)bank;
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < (0x25800u / 4u); i++)
+    {
+        sum = ((sum << 5) | (sum >> 27)) ^ words[i];
+    }
+    result->checksum = sum;
 }

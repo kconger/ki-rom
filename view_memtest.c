@@ -56,9 +56,13 @@
  *   0x08500000    2 KiB   bank pair, same bank
  *   0x08600000    1 KiB } bank pair, different banks
  *   0x08700000    1 KiB }
+ *
+ * and the heavy frame's sprites, about 50 KiB, at 0x08400000: the 1 MiB
+ * between the stride window and the bank pair.
  */
 #define PHYS_LAT_CHASE 0x08200000u
 #define PHYS_LAT_STRIDE 0x08300000u
+#define PHYS_BLEND 0x08400000u
 
 /*
  * The bank-conflict pair, and the one set of addresses on this page that is not
@@ -297,6 +301,8 @@ enum
     STEP_STRIDE,
     STEP_BANK,
     STEP_WRALLOC,
+    STEP_BLEND_BUILD,
+    STEP_BLEND_RUN,
     STEP_DONE,
 };
 
@@ -326,8 +332,9 @@ static bench_ide_status_t ide_status = BENCH_IDE_OK;
 static uint8_t step = 0;
 static uint8_t page = 0;
 
-// Table, SRAM sweep, latency. Any button steps through them in that order.
-#define PAGE_COUNT 3u
+// Table, SRAM sweep, latency, heavy frame. Any button steps through them in
+// that order.
+#define PAGE_COUNT 4u
 
 static uint32_t sweep[SWEEP_POINTS];
 static uint32_t sweep_back_bank = 0;
@@ -343,6 +350,15 @@ static uint32_t lat_wr_line = RESULT_PENDING;
 static uint32_t lat_wr_qword = RESULT_PENDING;
 static uint32_t lat_wr_ratio = RESULT_PENDING;
 static bool lat_chase_ready = false;
+
+/*
+ * The heavy frame. blend_built is false until the sprites are generated, and
+ * stays false if they would not fit their format, in which case the page
+ * reports skip.
+ */
+static bench_blend_result_t blend;
+static bool blend_built = false;
+static bool blend_measured = false;
 
 static bool exc_seen = false;
 static uint32_t exc_cause = 0;
@@ -647,7 +663,29 @@ static void run_step(void)
         return;
     }
 
-    measure_write_alloc();
+    if (step == STEP_WRALLOC)
+    {
+        measure_write_alloc();
+        step++;
+        return;
+    }
+
+    if (step == STEP_BLEND_BUILD)
+    {
+        blend_built = bench_blend_build(PHYS_BLEND);
+        step++;
+        return;
+    }
+
+    /*
+     * Into whichever bank is the back buffer: render() repaints it after this
+     * step returns, and the frame's sprites cover the same rows of either.
+     */
+    if (blend_built)
+    {
+        bench_blend_run(BENCH_PHYS(gBackBuffer), &blend);
+        blend_measured = true;
+    }
     step++;
 }
 
@@ -1143,6 +1181,139 @@ static void draw_latency(void)
     print_xy(COL_LAT_NAME, ROW_LAT_NOTES + ROW_PITCH, "Write times stores into cache, not the write-backs");
 }
 
+/*
+ * The heavy frame page. One row per sprite in the order they are drawn, then
+ * the frame: what the sprite blend of KI2's slowest barrel-explosion frame
+ * costs this machine, in cycles a pixel and in vblanks.
+ */
+#define ROW_HEAVY_TITLE 4
+#define ROW_HEAVY_SUB 16
+#define ROW_HEAVY_RULE_HDR 28
+#define ROW_HEAVY_HDR 32
+#define ROW_HEAVY_SPRITE 44
+#define ROW_HEAVY_PITCH 11
+#define ROW_HEAVY_RULE_FRAME 156
+#define ROW_HEAVY_FRAME 160
+#define ROW_HEAVY_SUM 172
+#define ROW_HEAVY_RULE_NOTES 184
+#define ROW_HEAVY_NOTES 188
+
+#define COL_HEAVY_NAME 2
+#define COL_HEAVY_DIR 74
+#define COL_HEAVY_PX 116
+#define COL_HEAVY_CYC 176
+#define COL_HEAVY_KCYC 236
+#define COL_HEAVY_SUM_NAME 150
+#define COL_HEAVY_SUM 204
+
+static const char *const heavy_names[BENCH_BLEND_BLITS] = {
+    "312x240", " 34x36", "146x112", "312x240", " 63x43",
+    " 56x52", " 81x90", "184x137", " 20x24", " 19x25"};
+
+static const char *const heavy_dirs[BENCH_BLEND_BLITS] = {
+    "right", "left", "left", "left", "right",
+    "right", "left", "left", "right", "right"};
+
+// An unsigned value right aligned in `width` characters.
+static void print_dec_right(const uint32_t value, const uint8_t width)
+{
+    uint8_t digits = 1;
+    for (uint32_t v = value; v >= 10u; v /= 10u)
+    {
+        digits++;
+    }
+    for (uint8_t i = digits; i < width; i++)
+    {
+        print_str(" ");
+    }
+    print_dec(value);
+}
+
+static void draw_heavy(void)
+{
+    set_text_color(COLOR_TITLE, 0xAAAA);
+    print_xy(34, ROW_HEAVY_TITLE, "HEAVY FRAME - KI2 BARREL EXPLOSION");
+
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(16, ROW_HEAVY_SUB, "its sprite blend: 10 sprites, best of 3, cold D$");
+
+    draw_horizontal_line(COL_REGION, ROW_HEAVY_RULE_HDR, 296, COLOR_RULE);
+
+    set_text_color(COLOR_HEADER, 0xAAAA);
+    print_xy(COL_HEAVY_NAME, ROW_HEAVY_HDR, "Sprite");
+    print_xy(COL_HEAVY_DIR, ROW_HEAVY_HDR, "runs");
+    print_xy(COL_HEAVY_PX, ROW_HEAVY_HDR, "pixels");
+    print_xy(COL_HEAVY_CYC, ROW_HEAVY_HDR, "cyc/px");
+    print_xy(COL_HEAVY_KCYC, ROW_HEAVY_HDR, "kcycles");
+
+    uint32_t pixels = 0;
+
+    for (uint8_t b = 0; b < BENCH_BLEND_BLITS; b++)
+    {
+        const uint16_t y = (uint16_t)(ROW_HEAVY_SPRITE + (b * ROW_HEAVY_PITCH));
+
+        set_text_color(COLOR_VALUE, 0xAAAA);
+        print_xy(COL_HEAVY_NAME, y, heavy_names[b]);
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        print_xy(COL_HEAVY_DIR, y, heavy_dirs[b]);
+
+        if (!blend_measured)
+        {
+            print_result(COL_HEAVY_CYC, y, (blend_built || step <= STEP_BLEND_RUN) ? RESULT_PENDING : RESULT_SKIPPED);
+            continue;
+        }
+
+        pixels += blend.pixels[b];
+        set_text_color(COLOR_VALUE, 0xAAAA);
+        set_xy(COL_HEAVY_PX, y);
+        print_dec_right(blend.pixels[b], 6);
+        print_result(COL_HEAVY_CYC, y, bench_cycles_x100(blend.pixels[b], blend.ticks[b]));
+        set_text_color(COLOR_VALUE, 0xAAAA);
+        set_xy(COL_HEAVY_KCYC, y);
+        print_dec_right((2u * blend.ticks[b]) / 1000u, 6);
+    }
+
+    draw_horizontal_line(COL_REGION, ROW_HEAVY_RULE_FRAME, 296, COLOR_RULE);
+
+    set_text_color(COLOR_VALUE, 0xAAAA);
+    print_xy(COL_HEAVY_NAME, ROW_HEAVY_FRAME, "Frame");
+
+    if (!blend_measured)
+    {
+        print_result(COL_HEAVY_CYC, ROW_HEAVY_FRAME, (blend_built || step <= STEP_BLEND_RUN) ? RESULT_PENDING : RESULT_SKIPPED);
+    }
+    else
+    {
+        // Vblanks at the measured refresh rate, or the nominal one before
+        // that has been measured: cycles x Hz / 10^8, Hz in hundredths.
+        const uint32_t hz_x100 = (vsync_hz != RESULT_PENDING && vsync_hz != RESULT_SKIPPED) ? vsync_hz : 5898u;
+        const uint32_t cycles = 2u * blend.frame_ticks;
+        const uint32_t vblanks_x100 = (uint32_t)(((uint64_t)cycles * hz_x100) / 100000000u);
+
+        set_text_color(COLOR_VALUE, 0xAAAA);
+        set_xy(COL_HEAVY_PX, ROW_HEAVY_FRAME);
+        print_dec_right(pixels, 6);
+        print_result(COL_HEAVY_CYC, ROW_HEAVY_FRAME, bench_cycles_x100(pixels, blend.frame_ticks));
+        set_text_color(COLOR_VALUE, 0xAAAA);
+        set_xy(COL_HEAVY_KCYC, ROW_HEAVY_FRAME);
+        print_dec_right(cycles / 1000u, 6);
+
+        print_result(COL_HEAVY_NAME, ROW_HEAVY_SUM, vblanks_x100);
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        print_str(" vblanks");
+
+        print_xy(COL_HEAVY_SUM_NAME, ROW_HEAVY_SUM, "checksum");
+        set_text_color(COLOR_VALUE, 0xAAAA);
+        set_xy(COL_HEAVY_SUM, ROW_HEAVY_SUM);
+        print_hex(blend.checksum, 32);
+    }
+
+    draw_horizontal_line(COL_REGION, ROW_HEAVY_RULE_NOTES, 296, COLOR_RULE);
+
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(COL_HEAVY_NAME, ROW_HEAVY_NOTES, "Same sprites everywhere: compare the checksum");
+}
+
 static void draw_status(void)
 {
     if (step >= STEP_DONE)
@@ -1188,6 +1359,14 @@ static void draw_status(void)
     else if (step == STEP_WRALLOC)
     {
         name = "write allocate";
+    }
+    else if (step == STEP_BLEND_BUILD)
+    {
+        name = "sprites";
+    }
+    else if (step == STEP_BLEND_RUN)
+    {
+        name = "heavy frame";
     }
 
     set_text_color(COLOR_HEADER, 0xAAAA);
@@ -1258,6 +1437,8 @@ static void reset_results(void)
     lat_wr_line = RESULT_PENDING;
     lat_wr_qword = RESULT_PENDING;
     lat_wr_ratio = RESULT_PENDING;
+    blend_built = false;
+    blend_measured = false;
 
     cpu_mips = RESULT_PENDING;
     vsync_hz = RESULT_PENDING;
@@ -1288,9 +1469,13 @@ static void render(const uint64_t frame_count)
     {
         draw_sweep();
     }
-    else
+    else if (page == 2)
     {
         draw_latency();
+    }
+    else
+    {
+        draw_heavy();
     }
 
     draw_status();
