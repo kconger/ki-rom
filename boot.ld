@@ -15,12 +15,40 @@ MEMORY {
 
 SECTIONS {
     .text : ALIGN(4) {
+        # start.S first: the reset and exception vectors sit at fixed offsets
+        # from the start of the ROM. lzss.S next, as it always was, so the
+        # block below starts where the kernels have always been.
+        *-start.o(.text .text.*);
+        *-lzss.o(.text .text.*);
+
+        # The measurement code, as one contiguous block: the timed kernels
+        # (cpu.S), everything that runs around and between their timed passes
+        # (bench.c: the cache sweep, best-of-3 loops, chain build and verify)
+        # and wdt_reset. The core's instruction cache is direct-mapped, 16 KiB
+        # with 32-byte lines (index = addr[13:5]); the board's R4600 is 2-way.
+        # Code that is contiguous and smaller than the cache cannot evict
+        # itself, so a kernel is never refetched from the EPROM inside its
+        # timed window because the sweep before it shared its cache line, and
+        # both machines measure memory rather than I-cache conflicts. Kept at
+        # or under 8 KiB so it also fits one way of a 2-way 16 KiB cache.
+        # tools/check_icache.py checks the linked result.
+        _sbench = .;
+        *-cpu.o(.text .text.*);
+        *-bench.o(.text .text.*);
+        *-wdt.o(.text .text.*);
+        _ebench = .;
+
         # .text.* matters: -Os enables -freorder-functions, so GCC emits
         # .text.startup (main) and .text.unlikely. Matching only *(.text) left
         # those as orphan sections, placed by ld's heuristic rather than by
         # this script -- and orphan placement differs between output formats.
         *(.text .text.*);
         *(.assets);
+
+        # Large data that is executed only once (the CPU test suite's image,
+        # which copies itself to DRAM) goes after all code, so it never moves
+        # code relative to the measurement block.
+        *(.cputest);
     } > rom AT > rom
 
     .data ORIGIN(sram) + 0x200 : ALIGN(8) {
@@ -33,7 +61,7 @@ SECTIONS {
         _edata = .;
     } > sram AT > rom
 
-    .bss ORIGIN(sram) + 0x200 + SIZEOF(.data) (NOLOAD) : ALIGN(8) {
+    .bss ALIGN(ORIGIN(sram) + 0x200 + SIZEOF(.data), 8) (NOLOAD) : ALIGN(8) {
         _sbss = .;
         *(.sbss);
         *(.bss);
@@ -81,6 +109,7 @@ SECTIONS {
     ASSERT(_ebss <= _stack_vma - 0x2000, "ERROR: .data + .bss leave less than 8K for the stack")
     ASSERT(_heap_vma + _heap_size <= 0x80030000, "ERROR: heap overruns VRAM bank 0")
     ASSERT(SIZEOF(.text) + SIZEOF(.data) <= LENGTH(rom), "ERROR: image does not fit in ROM")
+    ASSERT(_ebench - _sbench <= 0x2000, "ERROR: the measurement block is over 8 KiB and can alias itself in the I-cache")
 
     /DISCARD/ : { 
         *(.reginfo)

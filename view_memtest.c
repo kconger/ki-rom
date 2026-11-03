@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "view.h"
 #include "bench.h"
+#include "cputest.h"
 #include "draw.h"
 #include "io.h"
 #include "ki.h"
@@ -303,6 +304,9 @@ enum
     STEP_WRALLOC,
     STEP_BLEND_BUILD,
     STEP_BLEND_RUN,
+    // Last, so that a CPU test that hangs the board has already let every
+    // measurement above reach the screen.
+    STEP_CPUTEST,
     STEP_DONE,
 };
 
@@ -330,11 +334,12 @@ static uint32_t vsync_hz = RESULT_PENDING;
 static uint32_t ide_mbps = RESULT_PENDING;
 static bench_ide_status_t ide_status = BENCH_IDE_OK;
 static uint8_t step = 0;
-static uint8_t page = 0;
+static uint16_t page = 0;
 
-// Table, SRAM sweep, latency, heavy frame. Any button steps through them in
-// that order.
-#define PAGE_COUNT 4u
+// Table, SRAM sweep, latency, heavy frame, then the CPU tests, which take as
+// many pages as their report needs. Left or up steps back through them, any
+// other button forward, each wrapping round.
+#define PAGE_CPUTEST 4u
 
 static uint32_t sweep[SWEEP_POINTS];
 static uint32_t sweep_back_bank = 0;
@@ -673,6 +678,13 @@ static void run_step(void)
     if (step == STEP_BLEND_BUILD)
     {
         blend_built = bench_blend_build(PHYS_BLEND);
+        step++;
+        return;
+    }
+
+    if (step == STEP_CPUTEST)
+    {
+        cputest_run();
         step++;
         return;
     }
@@ -1314,12 +1326,261 @@ static void draw_heavy(void)
     print_xy(COL_HEAVY_NAME, ROW_HEAVY_NOTES, "Same sprites everywhere: compare the checksum");
 }
 
+/*
+ * The CPU test pages: first the summary and the list of the tests that failed,
+ * each with the page its report starts on, continued over as many pages as the
+ * list needs; then the report itself, every line of the suite's log but the
+ * passes and skips. Each failure there is its test's name followed by a line
+ * for every check that failed: file, line and expression, what it got and
+ * what it wanted.
+ */
+#define ROW_CT_TITLE 4
+#define ROW_CT_SUB 16
+#define ROW_CT_RULE_TOP 28
+#define ROW_CT_CPU 32
+#define ROW_CT_CONFIG 44
+#define ROW_CT_CHECKS 56
+#define ROW_CT_TESTS 68
+#define ROW_CT_RULE_LIST 80
+#define ROW_CT_LIST 84
+#define ROW_CT_RULE_MORE 16
+#define ROW_CT_MORE 20
+#define ROW_CT_PITCH 10
+#define ROW_CT_LAST 194
+
+#define COL_CT_NAME 2
+#define COL_CT_VALUE 56
+#define COL_CT_PAGE 266
+
+// Rows below the summary, and on a page of their own. A list page spends its
+// first row on the column headings.
+#define CT_ROWS_FIRST ((ROW_CT_LAST - ROW_CT_LIST) / ROW_CT_PITCH + 1u)
+#define CT_ROWS_MORE ((ROW_CT_LAST - ROW_CT_MORE) / ROW_CT_PITCH + 1u)
+#define CT_FAILS_FIRST (CT_ROWS_FIRST - 1u)
+#define CT_FAILS_MORE (CT_ROWS_MORE - 1u)
+
+#define COLOR_PASS 0x03E0u // green
+
+// Pages of the failed-test list, the summary's included.
+static uint16_t cputest_list_pages(void)
+{
+    const uint32_t fails = cputest_fail_count();
+
+    if (fails <= CT_FAILS_FIRST)
+    {
+        return 1u;
+    }
+
+    return (uint16_t)(1u + (fails - CT_FAILS_FIRST + CT_FAILS_MORE - 1u) / CT_FAILS_MORE);
+}
+
+static uint16_t cputest_page_count(void)
+{
+    return (uint16_t)(cputest_list_pages() + (cputest_line_count() + CT_ROWS_MORE - 1u) / CT_ROWS_MORE);
+}
+
+static const char *cputest_cpu_name(const uint32_t kind)
+{
+    switch (kind)
+    {
+    case 0x1u:
+        return "R4400";
+    case 0x2u:
+        return "R5000";
+    case 0x4u:
+        return "R4600";
+    default:
+        return "unknown";
+    }
+}
+
+static void print_n_xy(const uint16_t x, const uint16_t y, const char *text, const uint8_t length)
+{
+    char buffer[CPUTEST_COLUMNS + 1u];
+    const uint8_t n = length < CPUTEST_COLUMNS ? length : CPUTEST_COLUMNS;
+
+    for (uint8_t c = 0; c < n; c++)
+    {
+        buffer[c] = text[c];
+    }
+    buffer[n] = '\0';
+    print_xy(x, y, buffer);
+}
+
+static void draw_cputest_report(const uint32_t first, const uint16_t y0, const uint32_t rows)
+{
+    cputest_line_t lines[CT_ROWS_MORE];
+    const uint32_t n = cputest_lines(first, lines, rows);
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const uint16_t color = lines[i].kind == CPUTEST_LINE_FAIL     ? COLOR_ERROR
+                               : lines[i].kind == CPUTEST_LINE_DETAIL ? COLOR_VALUE
+                                                                      : COLOR_NOTE;
+        set_text_color(color, 0xAAAA);
+        print_n_xy((uint16_t)(COL_CT_NAME + (lines[i].continued ? CPUTEST_INDENT * 6u : 0u)),
+                   (uint16_t)(y0 + i * ROW_CT_PITCH), lines[i].text, lines[i].length);
+    }
+}
+
+// The failed tests from `first`, a row each, with the page each one's report
+// starts on.
+static void draw_cputest_fails(const uint32_t first, const uint16_t y0, const uint32_t rows)
+{
+    cputest_fail_t fails[CT_FAILS_MORE];
+    const uint32_t n = cputest_fails(first, fails, rows);
+    const uint16_t report = cputest_list_pages();
+
+    set_text_color(COLOR_HEADER, 0xAAAA);
+    print_xy(COL_CT_NAME, y0, "Failed test");
+    print_xy(COL_CT_PAGE, y0, "page");
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const uint16_t y = (uint16_t)(y0 + (i + 1u) * ROW_CT_PITCH);
+
+        set_text_color(COLOR_ERROR, 0xAAAA);
+        print_n_xy(COL_CT_NAME, y, fails[i].name, fails[i].length);
+        set_text_color(COLOR_VALUE, 0xAAAA);
+        set_xy(COL_CT_PAGE, y);
+        print_dec_right(report + fails[i].line / CT_ROWS_MORE + 1u, 4);
+    }
+}
+
+static void draw_cputest_summary(void)
+{
+    const volatile cputest_status_t *const status = cputest_status();
+    const cputest_state_t state = cputest_state();
+
+    set_text_color(COLOR_HEADER, 0xAAAA);
+    print_xy(COL_CT_NAME, ROW_CT_CPU, "CPU");
+    print_xy(COL_CT_NAME, ROW_CT_CONFIG, "Config");
+    print_xy(COL_CT_NAME, ROW_CT_CHECKS, "Checks");
+    print_xy(COL_CT_NAME, ROW_CT_TESTS, "Tests");
+
+    if (state == CPUTEST_PENDING)
+    {
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        print_xy(COL_CT_VALUE, ROW_CT_CPU, "--");
+        print_xy(COL_CT_VALUE, ROW_CT_CONFIG, "--");
+        print_xy(COL_CT_VALUE, ROW_CT_CHECKS, "--");
+        print_xy(COL_CT_VALUE, ROW_CT_TESTS, "--");
+        print_xy(COL_CT_NAME, ROW_CT_LIST, "They run after the memory tests.");
+        return;
+    }
+
+    set_text_color(COLOR_VALUE, 0xAAAA);
+    print_xy(COL_CT_VALUE, ROW_CT_CPU, cputest_cpu_name(status->cpu_kind));
+    print_str("   PRId ");
+    print_hex(status->prid, 16);
+    print_str("   FIR ");
+    print_hex(status->fir, 16);
+    set_xy(COL_CT_VALUE, ROW_CT_CONFIG);
+    print_hex(status->config, 32);
+
+    if (state == CPUTEST_HUNG)
+    {
+        char name[CPUTEST_NAME_LEN];
+        for (uint32_t i = 0; i < CPUTEST_NAME_LEN; i++)
+        {
+            name[i] = ((const volatile char *)status->current)[i];
+        }
+        name[CPUTEST_NAME_LEN - 1u] = '\0';
+
+        set_text_color(COLOR_ERROR, 0xAAAA);
+        print_xy(COL_CT_VALUE, ROW_CT_CHECKS, "did not finish: the board reset in");
+        print_xy(COL_CT_VALUE, ROW_CT_TESTS, name);
+        return;
+    }
+
+    if (status->rc == CPUTEST_RC_UNKNOWN_CPU)
+    {
+        set_text_color(COLOR_ERROR, 0xAAAA);
+        print_xy(COL_CT_VALUE, ROW_CT_CHECKS, "not run: no expectations for this PRId");
+        return;
+    }
+
+    set_xy(COL_CT_VALUE, ROW_CT_CHECKS);
+    print_dec(status->n_pass);
+    print_str(" passed   ");
+    set_text_color(status->n_fail != 0 ? COLOR_ERROR : COLOR_PASS, 0xAAAA);
+    print_dec(status->n_fail);
+    print_str(" failed");
+
+    set_text_color(COLOR_VALUE, 0xAAAA);
+    set_xy(COL_CT_VALUE, ROW_CT_TESTS);
+    print_dec(status->n_tests_run);
+    print_str(" run   ");
+    set_text_color(status->n_tests_failed != 0 ? COLOR_ERROR : COLOR_PASS, 0xAAAA);
+    print_dec(status->n_tests_failed);
+    print_str(" failed   ");
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_dec(status->n_skip);
+    print_str(" other CPUs");
+}
+
+static void draw_cputest(const uint16_t index)
+{
+    const uint16_t pages = cputest_page_count();
+    const uint16_t list_pages = cputest_list_pages();
+
+    set_text_color(COLOR_TITLE, 0xAAAA);
+    print_xy(70, ROW_CT_TITLE, "KILLER INSTINCT - CPU TESTS");
+    if (pages > 1u)
+    {
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        set_xy(266, ROW_CT_TITLE);
+        print_dec(index + 1u);
+        print_str("/");
+        print_dec(pages);
+    }
+
+    if (index != 0u)
+    {
+        draw_horizontal_line(COL_REGION, ROW_CT_RULE_MORE, 296, COLOR_RULE);
+        if (index < list_pages)
+        {
+            draw_cputest_fails(CT_FAILS_FIRST + (index - 1u) * CT_FAILS_MORE, ROW_CT_MORE, CT_FAILS_MORE);
+        }
+        else
+        {
+            draw_cputest_report((uint32_t)(index - list_pages) * CT_ROWS_MORE, ROW_CT_MORE, CT_ROWS_MORE);
+        }
+        return;
+    }
+
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(22, ROW_CT_SUB, "iris cpu-tests: R4600 expectations, little-endian");
+    draw_horizontal_line(COL_REGION, ROW_CT_RULE_TOP, 296, COLOR_RULE);
+
+    draw_cputest_summary();
+
+    draw_horizontal_line(COL_REGION, ROW_CT_RULE_LIST, 296, COLOR_RULE);
+
+    if (cputest_fail_count() != 0u)
+    {
+        draw_cputest_fails(0, ROW_CT_LIST, CT_FAILS_FIRST);
+    }
+    else if (cputest_line_count() != 0u)
+    {
+        // A run cut short, or one that printed without failing a check: the
+        // report is all there is.
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        print_xy(COL_CT_NAME, ROW_CT_LIST, "No test failed a check. The log follows.");
+    }
+    else if (cputest_state() == CPUTEST_FINISHED)
+    {
+        set_text_color(COLOR_PASS, 0xAAAA);
+        print_xy(COL_CT_NAME, ROW_CT_LIST, "Every test passed.");
+    }
+}
+
 static void draw_status(void)
 {
     if (step >= STEP_DONE)
     {
         set_text_color(color_fade_in_out(0x03E0, 0x0, FADE_SPEED_2S), 0xAAAA);
-        print_xy(40, ROW_STATUS, "Any button: next page   START: run again");
+        print_xy(10, ROW_STATUS, "Left/Up: back   Any other: next   START: run again");
         return;
     }
 
@@ -1367,6 +1628,10 @@ static void draw_status(void)
     else if (step == STEP_BLEND_RUN)
     {
         name = "heavy frame";
+    }
+    else if (step == STEP_CPUTEST)
+    {
+        name = "CPU tests";
     }
 
     set_text_color(COLOR_HEADER, 0xAAAA);
@@ -1473,9 +1738,13 @@ static void render(const uint64_t frame_count)
     {
         draw_latency();
     }
-    else
+    else if (page == 3)
     {
         draw_heavy();
+    }
+    else
+    {
+        draw_cputest((uint16_t)(page - PAGE_CPUTEST));
     }
 
     draw_status();
@@ -1488,17 +1757,28 @@ static void render(const uint64_t frame_count)
         // would wipe the record before it was ever shown.
         exc_seen = false;
         page = 0;
+        cputest_reset();
         reset_results();
     }
     else if (pressed != 0)
     {
-        page = (uint8_t)((page + 1u) % PAGE_COUNT);
+        const uint16_t pages = (uint16_t)(PAGE_CPUTEST + cputest_page_count());
+
+        if ((pressed & (BTN_LEFT | BTN_UP)) != 0)
+        {
+            page = (uint16_t)((page + pages - 1u) % pages);
+        }
+        else
+        {
+            page = (uint16_t)((page + 1u) % pages);
+        }
     }
 }
 
 static void load(void)
 {
     capture_exception();
+    cputest_load();
     reset_results();
 }
 

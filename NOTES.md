@@ -541,3 +541,25 @@ SRAM 0xA0000000
                     0000 0001 0011 1000 (0x138) (IDE Status/Command)
 1000 1000 0000 0000 0000 0000 0000 0000 (DRAM Cached)
 1000 0000 0000 0000 0000 0000 0000 0000 (SRAM Cached)
+
+## Memory test timing and the instruction cache
+
+The MiSTer core's instruction cache is direct-mapped: 16 KiB, 32-byte lines,
+index = addr[13:5]. The board's R4600 has a 2-way cache of the same size, so on
+the board two lines with the same index can both stay resident. On the core
+they evict each other. If a timed kernel shares an index with code that runs
+between its timed passes, such as the D-cache sweep, the kernel is refetched
+from the EPROM inside the timed window. That costs ~534 CPU cycles a line on
+the core and nothing on the board. Adding the CPU tests once moved bench.c
+exactly 13 x 16 KiB past cpu.S, and the latency page read ~1,068 cycles a pass
+too slow on the core.
+
+`boot.ld` therefore links the measurement code as one contiguous block,
+`_sbench`..`_ebench`, right after start.S and lzss.S: cpu.S (every timed
+kernel), bench.c (the sweep, the best-of-3 loops, chain build and verify) and
+wdt.c. Contiguous code smaller than the cache cannot evict itself. An ASSERT
+keeps the block at or under 8 KiB, so it also fits one way of a 2-way cache.
+Large data runs once and goes after all code (the CPU test image is in its own
+`.cputest` section). After every memtest link, `tools/check_icache.py` reads
+the ELF's symbols, and the build fails if any kernel line shares an index with
+another line of the block, or if a measurement function has left the block.

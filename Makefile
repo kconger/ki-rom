@@ -2,6 +2,7 @@ CC = mipsel-linux-gnu-gcc-14
 LD = mipsel-linux-gnu-ld
 OBJDUMP = mipsel-linux-gnu-objdump
 OBJCOPY = mipsel-linux-gnu-objcopy
+PYTHON = python3
 BOARD = 19489
 ROM = ki-l15d
 
@@ -28,10 +29,10 @@ C_SOURCES = $(wildcard *.c libs/umm_malloc/*.c)
 # a normal ROM build compiles exactly the same translation units it did before,
 # and view_memtest.c/bench.c cost nothing in the ROMs that ship the game.
 ifeq (${ROM},memtest)
-ASM_SOURCES = start.S lzss.S cpu.S
+ASM_SOURCES = start.S lzss.S cpu.S cputest_image.S
 C_SOURCES := $(filter-out view_main.c view_bootselect.c patches.c patch_%.c assets.c,${C_SOURCES})
 else
-C_SOURCES := $(filter-out view_memtest.c bench.c,${C_SOURCES})
+C_SOURCES := $(filter-out view_memtest.c bench.c cputest.c,${C_SOURCES})
 endif
 
 ASM_OBJS = $(ASM_SOURCES:%.S=build/${BOARD}-${ROM}-%.o)
@@ -42,6 +43,9 @@ DEPS = $(C_OBJS:.o=.d)
 rom: tools images gamerom ${ASM_OBJS} ${C_OBJS}
 	mkdir -p output
 	$(LD) -Tboot.ld -G 0 --no-undefined -o build/${BOARD}-${ROM}.elf ${ASM_OBJS} ${C_OBJS}
+ifeq (${ROM},memtest)
+	$(PYTHON) tools/check_icache.py build/${BOARD}-${ROM}.elf
+endif
 	$(OBJCOPY) -O binary build/${BOARD}-${ROM}.elf output/${BOARD}-${ROM}.u98
 	$(OBJDUMP) -D output/${BOARD}-${ROM}.u98 -b binary -mmips -M hex > output/${BOARD}-${ROM}.txt
 
@@ -58,6 +62,7 @@ build/${BOARD}-${ROM}-%.o: %.c
 .PHONY: clean
 clean:
 	-rm -rf build
+	-rm -rf cputest/build
 	-rm -rf tools/**/build
 	-rm -f font.h
 	-rm -f tools/lzss/lzss tools/png2bin/png2bin tools/gif2bin/gif2bin tools/fontgen/fontgen tools/disk-checksum/disk-checksum tools/kipack/kipack
@@ -142,6 +147,7 @@ tools/kipack/kipack: $(wildcard tools/kipack/*.c tools/kipack/*.h) tools/kipack/
 	$(MAKE) -C tools/kipack
 
 build/${BOARD}-${ROM}-print.o: font.h
+build/${BOARD}-${ROM}-cputest.o: font.h
 font.h: tools/fontgen/fontgen
 	tools/fontgen/fontgen > $@
 
@@ -150,6 +156,18 @@ font.h: tools/fontgen/fontgen
 # .zbin but does not reassemble the object, and the ROM silently keeps the
 # previous artwork until `make clean`.
 build/${BOARD}-${ROM}-images.o: ${IMAGES_ZBIN}
+
+# The CPU test suite is its own image, built for the n32 ABI by its own
+# Makefile with this toolchain, and embedded by cputest_image.S. Its Makefile
+# decides whether anything changed, so it is always asked. The recipe is on the
+# .bin itself, not on a phony target it depends on: make looks at a file's time
+# again only after running a recipe for it.
+.PHONY: FORCE
+FORCE:
+cputest/build/cputest.bin: FORCE
+	$(MAKE) -C cputest CC="$(CC)" LD="$(LD)" OBJCOPY="$(OBJCOPY)"
+build/${BOARD}-${ROM}-cputest_image.o: cputest/build/cputest.bin
+
 build/${BOARD}-${ROM}-roms.o: ${ROM_ZBIN} ${ROM_ADDR}
 
 -include $(DEPS)

@@ -82,8 +82,8 @@ make memtest BOARD=20351     # A-20351, output/20351-memtest.u98
 make memtests                # both boards
 ```
 
-It boots straight into the test and runs once. Any P1/P2 button steps through
-the pages; P1/P2 START runs everything again. It never starts a
+It boots straight into the test and runs once. Any P1/P2 button steps forward
+through the pages and Left or Up steps back; P1/P2 START runs everything again. It never starts a
 game and never writes to the disk.
 
 | Region | Physical range      | Measured window                |
@@ -188,6 +188,28 @@ the same checksum blended the same pixels (`0x727B3D0B`).
 
 The blend is 65-77% of the game's frame; its logic and background
 decompression are not reproduced.
+
+### CPU tests
+
+The pages after the heavy frame run the
+[iris CPU test suite](https://github.com/techomancer/iris/tree/main/cpu-tests)
+(BSD 3-Clause): about 260 bare-metal tests of the R4600's integer unit, FPU,
+exceptions, CP0, TLB, User mode and caches, each with expectations validated
+on real R4400 and R5000 silicon or derived for the R4600. It runs last, after
+every measurement is on screen, and takes the CPU over completely - its own
+exception vectors, the whole TLB, the caches - before handing it back.
+
+The first page sums it up: the CPU as PRId reports it, checks passed and
+failed, tests run, failed and skipped as another CPU's, and the list of the
+tests that failed with the page each one's report is on. The reports follow:
+the test, then a line for each failed check with its source line, the value
+it got and the one it wanted. A CPU that passes everything gets one page
+saying so. On these pages as on the others, Left or Up goes back a page.
+
+If a test hangs the board, the watchdog resets it and the page names the test
+it was in instead of running the suite again; START retries. `cputest/README.md`
+has the details: the port to little-endian, the memory it uses, and why MAME
+cannot run all of it.
 
 ## Patches
 
