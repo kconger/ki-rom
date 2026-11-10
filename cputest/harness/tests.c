@@ -4,6 +4,10 @@
  * that lists them, in the order they run. Ordering is deliberate: identity
  * first (a wrong CPU makes every later expectation meaningless), then the
  * simple ALU paths, then progressively more machine state.
+ *
+ * The KI board's CPU is an R4600 (MIPS III), so the MIPS IV groups in
+ * tests/mips4 are not built or run here: on a MIPS III part they only check
+ * that each MIPS IV instruction is refused.
  */
 
 #include "testlib.h"
@@ -26,8 +30,6 @@ DECLARE_GROUP(group_fpu_double);
 DECLARE_GROUP(group_fpu_fr0);
 DECLARE_GROUP(group_fpu_breadth);
 DECLARE_GROUP(group_cache);
-DECLARE_GROUP(group_mips4);
-DECLARE_GROUP(group_mips4_fp);
 
 /* `make ONLY=group_umode` builds a suite of identity + that one group, for
  * iterating on a slow target (a simulator). */
@@ -54,8 +56,6 @@ const struct test_group *const all_groups[] = {
     &group_fpu_fr0,
     &group_fpu_breadth,
     &group_cache,
-    &group_mips4,
-    &group_mips4_fp,
 };
 #endif
 

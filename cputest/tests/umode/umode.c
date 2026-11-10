@@ -39,6 +39,7 @@
 
 extern char _scratch_start[];
 
+#define ST_KSU_SUPER  0x00000008u
 #define ST_KSU_USER   0x00000010u
 
 /* Virtual layout. The code page and data page share one TLB entry (even and
@@ -285,6 +286,20 @@ UCODE(uc_jump,
     "    jr      $6\n"
     "    nop\n");
 
+/* A store through $4 as the first instruction. */
+UCODE(uc_store_first,
+    "    sw      $0, 0($4)\n"
+    "    syscall\n"
+    "    nop\n");
+
+/* Jump through $6 to a syscall. $6 is this page's own syscall seen through
+ * KSEG0, so a CPU that lets User mode fetch there still goes home. */
+UCODE(uc_jump_sys,
+    "    jr      $6\n"
+    "    nop\n"
+    "    syscall\n"
+    "    nop\n");
+
 /* 64-bit operations, stored to data+0 and data+8. */
 UCODE(uc_dword,
     "    daddiu  $8, $0, 1\n"
@@ -301,6 +316,9 @@ UCODE(uc_dword,
 #define N_MODES 3
 static const u32 modes[N_MODES] = { ST_KX | ST_SX | ST_UX, 0, ST_UX };
 static const char *const mode_names[N_MODES] = { "all64", "irix5", "irix6" };
+
+/* KSU the code runs with: User, except where a test says Supervisor. */
+static u32 umx_ksu = ST_KSU_USER;
 
 static u64 scratch_phys(void)
 {
@@ -393,7 +411,7 @@ static void umx_run(const u32 *code, const u32 *code_end, u64 entry, u32 mode,
     exc_user_handler = (u32)(unsigned long)&umx_handler;
 
     status = (saved_status & ~(ST_CU0 | ST_KX | ST_SX | ST_UX | 0x18u | ST_IE | ST_IM_MASK))
-             | ST_EXL | ST_KSU_USER | mode;
+             | ST_EXL | umx_ksu | mode;
     __asm__ __volatile__(A
         "dla    $8, 1f\n\t"
         "sd     $8, 8(%0)\n\t"             /* umx.return_pc */
@@ -453,7 +471,7 @@ static void expect(int m, u32 i, u32 code, u32 vecid, u64 epc)
     CHECK_EQ_AT(mode_names[m], (int)i, umx.rec[i].vector, vecid);
     CHECK_EQ_AT(mode_names[m], (int)i, umx.rec[i].epc, epc);
     /* Taken from User mode: KSU still says User inside the handler. */
-    CHECK_EQ_AT(mode_names[m], (int)i, umx.rec[i].status & 0x18u, ST_KSU_USER);
+    CHECK_EQ_AT(mode_names[m], (int)i, umx.rec[i].status & 0x18u, umx_ksu);
 }
 
 #define DUMP_IF_FAILED(m, before) do { if (cur_test_fails != (before)) umx_dump(m); } while (0)
@@ -470,9 +488,11 @@ static u32 refill_vecid(int m)
 
 /* ── tests ────────────────────────────────────────────────────────────────── */
 
+
 /* A syscall as the first instruction after ERET into User mode. */
 static void t_syscall_first(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -486,6 +506,7 @@ static void t_syscall_first(void)
 /* libc's _getuid: the syscall is the second instruction. */
 static void t_syscall_second(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -500,6 +521,7 @@ static void t_syscall_second(void)
  * after the handler's ERET. */
 static void t_break_then_syscall(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -519,6 +541,7 @@ static void t_break_then_syscall(void)
  */
 static void t_interrupt_then_syscall(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -544,6 +567,8 @@ static void load_miss(const u32 *code, const u32 *end, u64 load_pc)
 {
     int m;
     volatile u32 *data2 = (volatile u32 *)(_scratch_start + UMX_P_DATA2);
+
+    NEED_USER_FETCH();
 
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -594,6 +619,8 @@ static void fetch_miss(int via_jump)
 {
     int m;
 
+    NEED_USER_FETCH();
+
     put_code(UMX_P_CODE2, uc_sys, uc_sys_end);
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -633,6 +660,7 @@ static u64 kseg0_badvaddr(int m)
 /* A load from KSEG0 in User mode, as the first instruction: Address Error. */
 static void t_kseg0_load_first(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -649,6 +677,7 @@ static void t_kseg0_load_first(void)
 /* The same, third instruction: the first two are not the ones after ERET. */
 static void t_kseg0_load_third(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -667,10 +696,76 @@ static void t_kseg0_load_third(void)
     }
 }
 
+/*
+ * How far the R4600's BadVAddr rule reaches. A User load from KSEG0 with UX
+ * clear left 0x3FFFFF0080000000 on a KI board (kseg0_badvaddr). These reach an
+ * address with bit 31 set the other ways a 32-bit program can, all with
+ * KX = SX = UX = 0. Measured on a KI board (R4600): User loads from KSEG1-3
+ * and a User store to KSEG0 report the same upper half; a User fetch from
+ * KSEG0 and a Supervisor load from KSEG0 report the plain sign extension. So
+ * the rule is User mode, data accesses only. Only the first exception is
+ * checked: a refused fetch is refused again at every address the step-over
+ * policy tries, until the run gives up.
+ */
+static u64 user32_badvaddr(u64 va, u32 ksu, int fetch)
+{
+    if (is_r4600() && ksu == ST_KSU_USER && !fetch)
+        return 0x3FFFFF0000000000ull | (va & 0xFFFFFFFFull);
+    return va;
+}
+
+struct kaddr_probe {
+    const char *name;
+    const u32 *code, *end;
+    u32 ksu;
+    u32 exc;
+    u64 a0, a2;               /* the load or store address, or the jump target */
+};
+
+static void t_kernel_addr_badvaddr(void)
+{
+    NEED_USER_FETCH();
+    const u64 sys_k0 = 0xFFFFFFFF80000000ull | (scratch_phys() + UMX_P_CODE + 8);
+    const struct kaddr_probe probes[] = {
+        { "kseg1 load",        uc_load_first,  uc_load_first_end,  ST_KSU_USER,  EXC_ADEL,
+          0xFFFFFFFFA0000000ull, 0 },
+        { "kseg2 load",        uc_load_first,  uc_load_first_end,  ST_KSU_USER,  EXC_ADEL,
+          0xFFFFFFFFC0000000ull, 0 },
+        { "kseg3 load",        uc_load_first,  uc_load_first_end,  ST_KSU_USER,  EXC_ADEL,
+          0xFFFFFFFFE0000000ull, 0 },
+        { "kseg0 store",       uc_store_first, uc_store_first_end, ST_KSU_USER,  EXC_ADES,
+          0xFFFFFFFF80000000ull, 0 },
+        { "kseg0 fetch",       uc_jump_sys,    uc_jump_sys_end,    ST_KSU_USER,  EXC_ADEL,
+          0, sys_k0 },
+        { "super kseg0 load",  uc_load_first,  uc_load_first_end,  ST_KSU_SUPER, EXC_ADEL,
+          0xFFFFFFFF80000000ull, 0 },
+    };
+    unsigned i;
+
+    for (i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        const struct kaddr_probe *p = &probes[i];
+        u64 va = p->a0 ? p->a0 : p->a2;
+        u32 before = cur_test_fails;
+
+        umx_ksu = p->ksu;
+        umx_run(p->code, p->end, UMX_CODE_VA, modes[1], 0, UMX_POLICY_SKIP, p->a0, p->a2);
+        umx_ksu = ST_KSU_USER;
+
+        CHECK_EQ_AT(p->name, 0, umx.n >= 1, 1);
+        CHECK_EQ_AT(p->name, 0, CAUSE_EXC(umx.rec[0].cause), p->exc);
+        CHECK_EQ_AT(p->name, 0, umx.rec[0].badvaddr, user32_badvaddr(va, p->ksu, p->a0 == 0));
+        if (cur_test_fails != before) {
+            con_printf("   [%s]\n", p->name);
+            umx_dump(1);
+        }
+    }
+}
+
 /* A misaligned word load as the first instruction: Address Error, in every
  * mode (nothing about it depends on the address space). */
 static void t_unaligned_load_first(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -687,6 +782,7 @@ static void t_unaligned_load_first(void)
 /* With UX set, 64-bit operations are legal in User mode. */
 static void t_dword_ops_with_ux(void)
 {
+    NEED_USER_FETCH();
     int m;
     for (m = 0; m < N_MODES; m++) {
         u32 before = cur_test_fails;
@@ -716,6 +812,7 @@ static const struct test tests[] = {
     TEST("umode/fetch_miss_entry",     t_fetch_miss_entry,       CPU_ALL),
     TEST("umode/kseg0_load_first",     t_kseg0_load_first,       CPU_ALL),
     TEST("umode/kseg0_load_third",     t_kseg0_load_third,       CPU_ALL),
+    TEST("umode/kernel_addr_badvaddr", t_kernel_addr_badvaddr,   CPU_ALL),
     TEST("umode/unaligned_load_first", t_unaligned_load_first,   CPU_ALL),
     TEST("umode/dword_ops_with_ux",    t_dword_ops_with_ux,      CPU_ALL),
 };

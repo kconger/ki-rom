@@ -32,7 +32,7 @@ ifeq (${ROM},memtest)
 ASM_SOURCES = start.S lzss.S cpu.S cputest_image.S
 C_SOURCES := $(filter-out view_main.c view_bootselect.c patches.c patch_%.c assets.c,${C_SOURCES})
 else
-C_SOURCES := $(filter-out view_memtest.c bench.c cputest.c,${C_SOURCES})
+C_SOURCES := $(filter-out view_memtest.c bench.c cputest.c timing.c,${C_SOURCES})
 endif
 
 ASM_OBJS = $(ASM_SOURCES:%.S=build/${BOARD}-${ROM}-%.o)

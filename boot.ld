@@ -45,6 +45,13 @@ SECTIONS {
         *(.text .text.*);
         *(.assets);
 
+        # The memory test's tables and page text stay in the EPROM rather than
+        # being copied to SRAM with the rest of .rodata: they are read only to
+        # set a test up or draw a page, and .data and .bss share the 16 KiB
+        # below the stack, which has no room for them.
+        *-view_memtest.o(.rodata .rodata.*);
+        *-timing.o(.rodata .rodata.*);
+
         # Large data that is executed only once (the CPU test suite's image,
         # which copies itself to DRAM) goes after all code, so it never moves
         # code relative to the measurement block.

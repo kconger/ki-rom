@@ -9,10 +9,9 @@
 # The flags are upstream's (see docs/toolchain.md) except -EL: the KI board's
 # R4600 runs little-endian.
 #
-# -march=mips3 MIPS IV instructions are emitted only inside explicit `.set
-#              mips4` regions in the mips4/ tests, which are gated at runtime
-#              on PRId, so a stray MIPS IV opcode from the compiler would be a
-#              silent failure on a MIPS III part.
+# -march=mips3 the R4600 is MIPS III; a stray MIPS IV opcode from the
+#              compiler would be a silent failure on it. (The mips4/ tests,
+#              the only `.set mips4` code, are not built.)
 # -mabi=n32    NOT o32 and not the ROM's o64: n32 keeps a 64-bit value in one
 #              register, which is what the tests are about, and is the ABI the
 #              tests were written and validated under.
@@ -45,7 +44,8 @@ LDFLAGS   := -EL $(if $(LDEMU),-m $(LDEMU)) -T harness/link.ld -nostdlib
 
 HARNESS_C := harness/console.c harness/testlib.c harness/tests.c
 HARNESS_S := harness/start.S
-TEST_C    := $(sort $(wildcard tests/*/*.c))
+# Not the MIPS IV groups: the KI board's R4600 is MIPS III (see tests.c).
+TEST_C    := $(sort $(filter-out tests/mips4/%,$(wildcard tests/*/*.c)))
 
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(HARNESS_C) $(TEST_C)) \
         $(patsubst %.S,$(BUILD)/%.o,$(HARNESS_S))

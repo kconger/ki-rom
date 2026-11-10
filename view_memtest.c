@@ -11,6 +11,7 @@
 #include "io.h"
 #include "ki.h"
 #include "print.h"
+#include "timing.h"
 #include "video.h"
 
 /*
@@ -134,14 +135,6 @@ extern uint8_t _heap_size[];
 #define COL_CAC_WR 262
 #define COL_VALUE_W 36 // six characters at the 6px advance
 
-// The CPU results are label/value pairs rather than a wide table, so they go two
-// pairs to a row and the whole block costs four rows instead of seven.
-#define COL_CPU_L_NAME 2
-#define COL_CPU_L_VAL 92
-#define COL_CPU_R_NAME 150
-#define COL_CPU_R_VAL 240
-#define COL_CPU_MIPS 216
-
 #define ROW_TITLE 4
 #define ROW_BOARD 16
 #define ROW_RULE_TOP 28
@@ -150,13 +143,8 @@ extern uint8_t _heap_size[];
 #define ROW_RULE_HDR 56
 #define ROW_DATA 60
 #define ROW_PITCH 12
-#define ROW_RULE_IDE 108
-#define ROW_IDE 112
-#define ROW_RULE_CPU 124
-#define ROW_CPU 128
-#define ROW_CPU_DATA 140
-#define ROW_RULE_NOTES 176
-#define ROW_NOTES 180
+#define ROW_RULE_NOTES 188
+#define ROW_NOTES 192
 #define ROW_STATUS 204
 
 // A measurement that has not run yet, and one that was deliberately skipped.
@@ -222,12 +210,9 @@ extern uint8_t _heap_size[];
 #define ROW_LAT_RULE_BANK 96
 #define ROW_LAT_BANK_HDR 100
 #define ROW_LAT_BANK 112
-#define ROW_LAT_RULE_LOAD 124
-#define ROW_LAT_LOAD_HDR 128
-#define ROW_LAT_LOAD 140
-#define ROW_LAT_RULE_WR 152
-#define ROW_LAT_WR_HDR 156
-#define ROW_LAT_WR 168
+#define ROW_LAT_RULE_WR 124
+#define ROW_LAT_WR_HDR 128
+#define ROW_LAT_WR 140
 #define ROW_LAT_RULE_NOTES 176
 #define ROW_LAT_NOTES 180
 
@@ -304,9 +289,11 @@ enum
     STEP_WRALLOC,
     STEP_BLEND_BUILD,
     STEP_BLEND_RUN,
+    // timing.c's cycle-level tests, a step each.
+    STEP_TIMING,
     // Last, so that a CPU test that hangs the board has already let every
     // measurement above reach the screen.
-    STEP_CPUTEST,
+    STEP_CPUTEST = STEP_TIMING + TM_STEPS,
     STEP_DONE,
 };
 
@@ -336,10 +323,22 @@ static bench_ide_status_t ide_status = BENCH_IDE_OK;
 static uint8_t step = 0;
 static uint16_t page = 0;
 
-// Table, SRAM sweep, latency, heavy frame, then the CPU tests, which take as
-// many pages as their report needs. Left or up steps back through them, any
-// other button forward, each wrapping round.
-#define PAGE_CPUTEST 4u
+// One topic a page, then the CPU tests, which take as many pages as their
+// report needs. Left or up steps back through them, any other button
+// forward, each wrapping round.
+enum
+{
+    PAGE_BANDWIDTH,
+    PAGE_SWEEP,
+    PAGE_LATENCY,
+    PAGE_CACHES,
+    PAGE_INTEGER,
+    PAGE_FPU,
+    PAGE_SYSTEM,
+    PAGE_HEAVY,
+    PAGE_SPREAD,
+    PAGE_CPUTEST,
+};
 
 static uint32_t sweep[SWEEP_POINTS];
 static uint32_t sweep_back_bank = 0;
@@ -682,22 +681,30 @@ static void run_step(void)
         return;
     }
 
-    if (step == STEP_CPUTEST)
+    if (step == STEP_BLEND_RUN)
     {
-        cputest_run();
+        /*
+         * Into whichever bank is the back buffer: render() repaints it after
+         * this step returns, and the frame's sprites cover the same rows of
+         * either.
+         */
+        if (blend_built)
+        {
+            bench_blend_run(BENCH_PHYS(gBackBuffer), &blend);
+            blend_measured = true;
+        }
         step++;
         return;
     }
 
-    /*
-     * Into whichever bank is the back buffer: render() repaints it after this
-     * step returns, and the frame's sprites cover the same rows of either.
-     */
-    if (blend_built)
+    if (step < STEP_CPUTEST)
     {
-        bench_blend_run(BENCH_PHYS(gBackBuffer), &blend);
-        blend_measured = true;
+        timing_run_step((uint8_t)(step - STEP_TIMING));
+        step++;
+        return;
     }
+
+    cputest_run();
     step++;
 }
 
@@ -757,11 +764,11 @@ static const char *ide_status_str(void)
     switch (ide_status)
     {
     case BENCH_IDE_NOT_READY:
-        return "no drive / not ready";
+        return "no drive";
     case BENCH_IDE_NO_DATA:
-        return "transfer timed out";
+        return "timed out";
     case BENCH_IDE_ERROR:
-        return "drive reported an error";
+        return "drive error";
     default:
         return "";
     }
@@ -770,12 +777,14 @@ static const char *ide_status_str(void)
 static void draw_header(void)
 {
     set_text_color(COLOR_TITLE, 0xAAAA);
-    print_xy(22, ROW_TITLE, "KILLER INSTINCT - MEMORY, CPU & IDE SPEED TEST");
+    print_xy(58, ROW_TITLE, "KILLER INSTINCT - MEMORY BANDWIDTH");
 
     set_text_color(COLOR_NOTE, 0xAAAA);
     print_xy(61, ROW_BOARD, "Board " KI_BOARD_STR "   Built " __DATE__);
 
     draw_horizontal_line(COL_REGION, ROW_RULE_TOP, 296, COLOR_RULE);
+
+    print_xy(COL_REGION, ROW_HDR1, "MB/s, 64KiB, best of 3");
 
     set_text_color(COLOR_HEADER, 0xAAAA);
     print_xy(COL_UNC_RD + 15, ROW_HDR1, "Uncached");
@@ -809,84 +818,67 @@ static void draw_table(void)
     }
 }
 
-static void draw_ide(void)
-{
-    draw_horizontal_line(COL_REGION, ROW_RULE_IDE, 296, COLOR_RULE);
-
-    set_text_color(COLOR_VALUE, 0xAAAA);
-    print_xy(COL_REGION, ROW_IDE, "IDE");
-    set_text_color(COLOR_NOTE, 0xAAAA);
-    print_xy(COL_RANGE, ROW_IDE, "LBA 0-127 (64K)");
-
-    if (ide_status != BENCH_IDE_OK)
-    {
-        set_text_color(COLOR_ERROR, 0xAAAA);
-        print_xy(COL_UNC_RD, ROW_IDE, ide_status_str());
-        return;
-    }
-
-    print_result(COL_UNC_RD, ROW_IDE, ide_mbps);
-    if (ide_mbps != RESULT_PENDING)
-    {
-        set_text_color(COLOR_NOTE, 0xAAAA);
-        print_str(" MB/s");
-    }
-}
-
 /*
- * Two label/value pairs per row. The left column is the one that is read
- * against the ALU baseline, the right one holds the slow instructions plus the
- * vsync cross-check -- which is a frequency, not a cycle count, hence the unit
- * in its label.
+ * Page 1's lower half: the two memory figures from timing.c. Uncached stores of
+ * each width (the board rewrites a whole doubleword for a narrower one), and
+ * uncached loads timed inside vblank and mid-frame, which differ if scanout
+ * takes memory cycles from the CPU. Same four columns as the table above.
  */
-static void draw_cpu(void)
+#define ROW_RULE_STORE 108
+#define ROW_STORE_HDR 112
+#define ROW_STORE 124
+#define ROW_RULE_SCAN 148
+#define ROW_SCAN_HDR 152
+#define ROW_SCAN 164
+
+static const uint16_t table_cols[4] = {COL_UNC_RD, COL_UNC_WR, COL_CAC_RD, COL_CAC_WR};
+static const char *const store_widths[TM_STORE_WIDTHS] = {"    sb", "    sh", "    sw", "    sd"};
+static const char *const scan_regions[TM_REGION_COUNT] = {"  SRAM", " VRAMf", " VRAMb", "  DRAM"};
+
+static void draw_memory_timing(void)
 {
-    const char *const left_names[] = {
-        cpu_names[BENCH_CPU_ALU],
-        cpu_names[BENCH_CPU_LOAD],
-        cpu_names[BENCH_CPU_MUL],
-    };
-    const char *const right_names[] = {
-        cpu_names[BENCH_CPU_DIV],
-        cpu_names[BENCH_CPU_FPU],
-        "Vsync (Hz)",
-    };
-
-    const uint32_t left_values[] = {
-        cpu_cycles[BENCH_CPU_ALU],
-        cpu_cycles[BENCH_CPU_LOAD],
-        cpu_cycles[BENCH_CPU_MUL],
-    };
-    const uint32_t right_values[] = {
-        cpu_cycles[BENCH_CPU_DIV],
-        cpu_cycles[BENCH_CPU_FPU],
-        vsync_hz,
-    };
-
-    draw_horizontal_line(COL_REGION, ROW_RULE_CPU, 296, COLOR_RULE);
+    draw_horizontal_line(COL_REGION, ROW_RULE_STORE, 296, COLOR_RULE);
 
     set_text_color(COLOR_VALUE, 0xAAAA);
-    print_xy(COL_CPU_L_NAME, ROW_CPU, "CPU");
+    print_xy(COL_REGION, ROW_STORE_HDR, "Uncached store");
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(COL_RANGE + 48, ROW_STORE_HDR, "cyc");
     set_text_color(COLOR_HEADER, 0xAAAA);
-    print_xy(COL_CPU_L_VAL, ROW_CPU, "cycles/op");
-
-    print_result(COL_CPU_MIPS, ROW_CPU, cpu_mips);
-    if (cpu_mips != RESULT_PENDING)
+    for (uint8_t i = 0; i < TM_STORE_WIDTHS; i++)
     {
-        set_text_color(COLOR_NOTE, 0xAAAA);
-        print_str(" MIPS");
+        print_xy(table_cols[i], ROW_STORE_HDR, store_widths[i]);
     }
 
-    for (uint8_t i = 0; i < 3; i++)
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(COL_REGION, ROW_STORE, "SRAM");
+    print_xy(COL_RANGE, ROW_STORE, "14000");
+    print_xy(COL_REGION, ROW_STORE + ROW_PITCH, "DRAM");
+    print_xy(COL_RANGE, ROW_STORE + ROW_PITCH, "81C0000");
+    for (uint8_t i = 0; i < TM_STORE_WIDTHS; i++)
     {
-        const uint16_t y = ROW_CPU_DATA + (i * ROW_PITCH);
+        print_result(table_cols[i], ROW_STORE, tm.store_sram[i]);
+        print_result(table_cols[i], ROW_STORE + ROW_PITCH, tm.store_dram[i]);
+    }
 
-        set_text_color(COLOR_NOTE, 0xAAAA);
-        print_xy(COL_CPU_L_NAME, y, left_names[i]);
-        print_xy(COL_CPU_R_NAME, y, right_names[i]);
+    draw_horizontal_line(COL_REGION, ROW_RULE_SCAN, 296, COLOR_RULE);
 
-        print_result(COL_CPU_L_VAL, y, left_values[i]);
-        print_result(COL_CPU_R_VAL, y, right_values[i]);
+    set_text_color(COLOR_VALUE, 0xAAAA);
+    print_xy(COL_REGION, ROW_SCAN_HDR, "Uncached ld");
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(COL_RANGE + 48, ROW_SCAN_HDR, "cyc");
+    set_text_color(COLOR_HEADER, 0xAAAA);
+    for (uint8_t i = 0; i < TM_REGION_COUNT; i++)
+    {
+        print_xy(table_cols[i], ROW_SCAN_HDR, scan_regions[i]);
+    }
+
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(COL_REGION, ROW_SCAN, "in vblank");
+    print_xy(COL_REGION, ROW_SCAN + ROW_PITCH, "mid frame");
+    for (uint8_t i = 0; i < TM_REGION_COUNT; i++)
+    {
+        print_result(table_cols[i], ROW_SCAN, tm.scan_vblank[i]);
+        print_result(table_cols[i], ROW_SCAN + ROW_PITCH, tm.scan_active[i]);
     }
 }
 
@@ -926,24 +918,22 @@ static void draw_notes(void)
 {
     draw_horizontal_line(COL_REGION, ROW_RULE_NOTES, 296, COLOR_RULE);
 
-    set_text_color(COLOR_NOTE, 0xAAAA);
-    print_xy(COL_REGION, ROW_NOTES, "64KiB window, best of 3, MB=10^6 B, cyc = 2 x Count");
-
     /*
-     * The second note line doubles as the fault report. A restart through
+     * The note line doubles as the fault report. A restart through
      * _exception_handler looks exactly like a watchdog reset from the outside,
      * so when there is something to say, saying it matters more than the note.
      */
     if (!exc_seen)
     {
-        print_xy(COL_REGION, ROW_NOTES + ROW_PITCH, "SRAM window 0x14000-0x23FFF; VRAM as back buffer");
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        print_xy(COL_REGION, ROW_NOTES, "SRAM window 0x14000-0x23FFF; VRAM as back buffer");
         return;
     }
 
     const uint32_t code = (exc_cause >> 2) & 0x1Fu;
 
     set_text_color(COLOR_ERROR, 0xAAAA);
-    set_xy(COL_REGION, ROW_NOTES + ROW_PITCH);
+    set_xy(COL_REGION, ROW_NOTES);
     print_str("EXC ");
     print_str(exc_name(code));
     print_str("/");
@@ -968,10 +958,10 @@ static void draw_notes(void)
 static void draw_sweep(void)
 {
     set_text_color(COLOR_TITLE, 0xAAAA);
-    print_xy(88, ROW_SWEEP_TITLE, "SRAM UNCACHED READ SWEEP");
+    print_xy(82, ROW_SWEEP_TITLE, "KILLER INSTINCT - SRAM MAP");
 
     set_text_color(COLOR_NOTE, 0xAAAA);
-    print_xy(28, ROW_SWEEP_SUB, "8KiB window, 16KiB steps, uncached read only");
+    print_xy(28, ROW_SWEEP_SUB, "uncached read, 8KiB window every 16KiB, MB/s");
 
     uint32_t max = 0;
     for (uint8_t i = 0; i < SWEEP_POINTS; i++)
@@ -1095,7 +1085,7 @@ static void draw_lat_pair(const uint16_t name_x, const uint16_t value_x, const u
 static void draw_latency(void)
 {
     set_text_color(COLOR_TITLE, 0xAAAA);
-    print_xy(70, ROW_LAT_TITLE, "SDRAM LATENCY - DEPENDENT MISS");
+    print_xy(64, ROW_LAT_TITLE, "KILLER INSTINCT - MEMORY LATENCY");
 
     set_text_color(COLOR_NOTE, 0xAAAA);
     print_xy(28, ROW_LAT_SUB, "cycles per dependent load, best of 3, cold D$");
@@ -1147,18 +1137,6 @@ static void draw_latency(void)
     draw_lat_pair(COL_LAT_P0_NAME, COL_LAT_P0_VAL, ROW_LAT_BANK, "1KiB", lat_bank_same);
     draw_lat_pair(COL_LAT_P1_NAME, COL_LAT_P1_VAL, ROW_LAT_BANK, "bank01", lat_bank_diff);
     draw_lat_pair(COL_LAT_P2_NAME, COL_LAT_P2_VAL, ROW_LAT_BANK, "ratio", lat_bank_ratio);
-
-    // Load issue rate, the three variants read against each other.
-    draw_horizontal_line(COL_REGION, ROW_LAT_RULE_LOAD, 296, COLOR_RULE);
-
-    set_text_color(COLOR_VALUE, 0xAAAA);
-    print_xy(COL_LAT_NAME, ROW_LAT_LOAD_HDR, "Load");
-    set_text_color(COLOR_HEADER, 0xAAAA);
-    print_xy(44, ROW_LAT_LOAD_HDR, "lw hitting in D$, cycles per load");
-
-    draw_lat_pair(COL_LAT_P0_NAME, COL_LAT_P0_VAL, ROW_LAT_LOAD, "1 dest", cpu_cycles[BENCH_CPU_LOAD]);
-    draw_lat_pair(COL_LAT_P1_NAME, COL_LAT_P1_VAL, ROW_LAT_LOAD, "8 dest", cpu_cycles[BENCH_CPU_LOAD_8]);
-    draw_lat_pair(COL_LAT_P2_NAME, COL_LAT_P2_VAL, ROW_LAT_LOAD, "chain", cpu_cycles[BENCH_CPU_LOAD_DEP]);
 
     // Write allocate.
     draw_horizontal_line(COL_REGION, ROW_LAT_RULE_WR, 296, COLOR_RULE);
@@ -1244,10 +1222,10 @@ static void print_dec_right(const uint32_t value, const uint8_t width)
 static void draw_heavy(void)
 {
     set_text_color(COLOR_TITLE, 0xAAAA);
-    print_xy(34, ROW_HEAVY_TITLE, "HEAVY FRAME - KI2 BARREL EXPLOSION");
+    print_xy(73, ROW_HEAVY_TITLE, "KILLER INSTINCT - HEAVY FRAME");
 
     set_text_color(COLOR_NOTE, 0xAAAA);
-    print_xy(16, ROW_HEAVY_SUB, "its sprite blend: 10 sprites, best of 3, cold D$");
+    print_xy(16, ROW_HEAVY_SUB, "KI2 barrel explosion blend: 10 sprites, cold D$");
 
     draw_horizontal_line(COL_REGION, ROW_HEAVY_RULE_HDR, 296, COLOR_RULE);
 
@@ -1324,6 +1302,287 @@ static void draw_heavy(void)
 
     set_text_color(COLOR_NOTE, 0xAAAA);
     print_xy(COL_HEAVY_NAME, ROW_HEAVY_NOTES, "Same sprites everywhere: compare the checksum");
+}
+
+/*
+ * The topic pages built from timing.c's figures: caches and TLB, integer and
+ * floating-point instructions, system and I/O, and the spread of repeated
+ * runs. Each is a title, a subtitle, and two columns of label/value rows, a
+ * header row starting each group.
+ */
+#define COL_KV_L_NAME 2
+#define COL_KV_L_VAL 98
+#define COL_KV_R_NAME 162
+#define COL_KV_R_VAL 258
+#define ROW_KV_TITLE 4
+#define ROW_KV_SUB 16
+#define ROW_KV_RULE 28
+#define ROW_KV 32
+#define ROW_KV_PITCH 10
+
+// A row whose value is this is a group header: its name only, in header colour.
+#define KV_HEADER 0xFFFFFFFEu
+
+typedef struct
+{
+    const char *name;
+    uint32_t value;
+} kv_t;
+
+static uint16_t text_width(const char *text)
+{
+    uint16_t n = 0;
+    while (text[n] != '\0')
+    {
+        n++;
+    }
+    return (uint16_t)(n * 6u);
+}
+
+static void draw_page_head(const char *title, const char *sub)
+{
+    set_text_color(COLOR_TITLE, 0xAAAA);
+    print_xy((uint16_t)((320u - text_width(title)) / 2u), ROW_KV_TITLE, title);
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy((uint16_t)((320u - text_width(sub)) / 2u), ROW_KV_SUB, sub);
+    draw_horizontal_line(COL_REGION, ROW_KV_RULE, 296, COLOR_RULE);
+}
+
+static void draw_kv(const uint16_t x_name, const uint16_t x_value, const kv_t *rows, const uint8_t count)
+{
+    for (uint8_t i = 0; i < count; i++)
+    {
+        const uint16_t y = (uint16_t)(ROW_KV + i * ROW_KV_PITCH);
+
+        if (rows[i].value == KV_HEADER)
+        {
+            set_text_color(COLOR_HEADER, 0xAAAA);
+            print_xy(x_name, y, rows[i].name);
+            continue;
+        }
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        print_xy(x_name, y, rows[i].name);
+        print_result(x_value, y, rows[i].value);
+    }
+}
+
+#define KV_COUNT(a) ((uint8_t)(sizeof(a) / sizeof((a)[0])))
+
+static void draw_caches(void)
+{
+    draw_page_head("KILLER INSTINCT - CACHES AND TLB", "cycles, best of 3, loop warmed once first");
+
+    const kv_t left[] = {
+        {"D$ hit, cyc/load", KV_HEADER},
+        {"lw, 1 dest", cpu_cycles[BENCH_CPU_LOAD]},
+        {"lw, 8 dests", cpu_cycles[BENCH_CPU_LOAD_8]},
+        {"lw chain", cpu_cycles[BENCH_CPU_LOAD_DEP]},
+        {"D$ sets, cyc/access", KV_HEADER},
+        {tm_dc_names[0], tm.dc_cyc[0]},
+        {tm_dc_names[1], tm.dc_cyc[1]},
+        {tm_dc_names[2], tm.dc_cyc[2]},
+        {tm_dc_names[3], tm.dc_cyc[3]},
+        {"D$ ops, cyc/op", KV_HEADER},
+        {tm_dc_names[4], tm.dc_cyc[4]},
+        {tm_dc_names[5], tm.dc_cyc[5]},
+        {tm_dc_names[6], tm.dc_cyc[6]},
+    };
+    const kv_t right[] = {
+        {"I$, cyc/instr", KV_HEADER},
+        {tm_ic_names[0], tm.ic_cyc[0]},
+        {tm_ic_names[1], tm.ic_cyc[1]},
+        {tm_ic_names[2], tm.ic_cyc[2]},
+        {tm_ic_names[3], tm.ic_cyc[3]},
+        {tm_ic_names[4], tm.ic_cyc[4]},
+        {tm_ic_names[5], tm.ic_cyc[5]},
+        {"TLB, cyc/load", KV_HEADER},
+        {tm_tlb_names[0], tm.tlb_cyc[0]},
+        {tm_tlb_names[1], tm.tlb_cyc[1]},
+        {tm_tlb_names[2], tm.tlb_cyc[2]},
+        {tm_tlb_names[3], tm.tlb_cyc[3]},
+        {tm_tlb_names[4], tm.tlb_cyc[4]},
+        {tm_tlb_names[5], tm.tlb_cyc[5]},
+    };
+
+    draw_kv(COL_KV_L_NAME, COL_KV_L_VAL, left, KV_COUNT(left));
+    draw_kv(COL_KV_R_NAME, COL_KV_R_VAL, right, KV_COUNT(right));
+}
+
+static void draw_integer(void)
+{
+    draw_page_head("KILLER INSTINCT - CPU INTEGER", "pipeline cycles, caches warm, best of 3");
+
+    const kv_t left[] = {
+        {"Throughput, cyc/op", KV_HEADER},
+        {"addu chain", cpu_cycles[BENCH_CPU_ALU]},
+        {"multu", cpu_cycles[BENCH_CPU_MUL]},
+        {"divu", cpu_cycles[BENCH_CPU_DIV]},
+        {"addu MIPS", cpu_mips},
+        {"Latency, cyc/pair", KV_HEADER},
+        {tm_int_names[0], tm.int_cyc[0]},
+        {tm_int_names[1], tm.int_cyc[1]},
+        {tm_int_names[2], tm.int_cyc[2]},
+        {tm_int_names[3], tm.int_cyc[3]},
+        {tm_int_names[4], tm.int_cyc[4]},
+    };
+    const kv_t right[] = {
+        {"Branch, cyc/pair", KV_HEADER},
+        {tm_int_names[5], tm.int_cyc[5]},
+        {tm_int_names[6], tm.int_cyc[6]},
+        {tm_int_names[7], tm.int_cyc[7]},
+        {"Load/store, cyc", KV_HEADER},
+        {tm_int_names[8], tm.int_cyc[8]},
+        {tm_int_names[9], tm.int_cyc[9]},
+        {tm_int_names[10], tm.int_cyc[10]},
+        {tm_int_names[11], tm.int_cyc[11]},
+        {tm_int_names[12], tm.int_cyc[12]},
+        {tm_int_names[13], tm.int_cyc[13]},
+        {"Other, cyc/op", KV_HEADER},
+        {tm_int_names[14], tm.int_cyc[14]},
+        {tm_int_names[15], tm.int_cyc[15]},
+    };
+
+    draw_kv(COL_KV_L_NAME, COL_KV_L_VAL, left, KV_COUNT(left));
+    draw_kv(COL_KV_R_NAME, COL_KV_R_VAL, right, KV_COUNT(right));
+}
+
+static void draw_fpu(void)
+{
+    draw_page_head("KILLER INSTINCT - CPU FLOATING POINT", "pipeline cycles, best of 3, FR=1");
+
+    const kv_t left[] = {
+        {"Latency, cyc/op", KV_HEADER},
+        {"add.s", cpu_cycles[BENCH_CPU_FPU]},
+        {tm_fpu_names[0], tm.fpu_cyc[0]},
+        {tm_fpu_names[1], tm.fpu_cyc[1]},
+        {tm_fpu_names[2], tm.fpu_cyc[2]},
+        {tm_fpu_names[3], tm.fpu_cyc[3]},
+        {tm_fpu_names[4], tm.fpu_cyc[4]},
+        {tm_fpu_names[5], tm.fpu_cyc[5]},
+        {tm_fpu_names[6], tm.fpu_cyc[6]},
+    };
+    const kv_t right[] = {
+        {"Convert/move, cyc", KV_HEADER},
+        {tm_fpu_names[7], tm.fpu_cyc[7]},
+        {tm_fpu_names[8], tm.fpu_cyc[8]},
+        {tm_fpu_names[9], tm.fpu_cyc[9]},
+        {tm_fpu_names[10], tm.fpu_cyc[10]},
+        {tm_fpu_names[11], tm.fpu_cyc[11]},
+        {tm_fpu_names[12], tm.fpu_cyc[12]},
+        {tm_fpu_names[13], tm.fpu_cyc[13]},
+        {"Throughput, cyc/op", KV_HEADER},
+        {tm_fpu_names[14], tm.fpu_cyc[14]},
+        {tm_fpu_names[15], tm.fpu_cyc[15]},
+    };
+
+    draw_kv(COL_KV_L_NAME, COL_KV_L_VAL, left, KV_COUNT(left));
+    draw_kv(COL_KV_R_NAME, COL_KV_R_VAL, right, KV_COUNT(right));
+}
+
+static void draw_system(void)
+{
+    draw_page_head("KILLER INSTINCT - SYSTEM AND I/O", "video, interrupts, I/O registers, IDE, sound");
+
+    const kv_t left[] = {
+        {"Video", KV_HEADER},
+        {"vsync Hz", vsync_hz},
+        {"frame us", tm.frame_us},
+        {"vblank us", tm.vblank_us},
+        {"Interrupts, cyc", KV_HEADER},
+        {"Compare min", tm.irq_cmp_min},
+        {"Compare max", tm.irq_cmp_max},
+        {"vblank min", tm.irq_vbl_min},
+        {"vblank max", tm.irq_vbl_max},
+        {"syscall+eret", tm.syscall_cyc},
+    };
+    const bool ide_ok = ide_status == BENCH_IDE_OK;
+    const kv_t right[] = {
+        {"I/O read, cyc", KV_HEADER},
+        {tm_io_names[0], tm.io_cyc[0]},
+        {tm_io_names[1], tm.io_cyc[1]},
+        {tm_io_names[2], tm.io_cyc[2]},
+        {tm_io_names[3], tm.io_cyc[3]},
+        {tm_io_names[4], tm.io_cyc[4]},
+        {tm_io_names[5], tm.io_cyc[5]},
+        {"IDE, LBA 0-127", KV_HEADER},
+        {ide_ok ? "read MB/s" : ide_status_str(), ide_ok ? ide_mbps : RESULT_SKIPPED},
+        {"Sound board (DCS)", KV_HEADER},
+        {"ack min us", tm.dcs_ack_min},
+        {"ack max us", tm.dcs_ack_max},
+        {"boot ms", tm.dcs_boot},
+    };
+
+    draw_kv(COL_KV_L_NAME, COL_KV_L_VAL, left, KV_COUNT(left));
+    draw_kv(COL_KV_R_NAME, COL_KV_R_VAL, right, KV_COUNT(right));
+}
+
+/*
+ * Each kernel run 64 times: the fastest, the median and the slowest, in
+ * cycles per operation, and how the 64 spread between the fastest and the
+ * slowest as eight bars. A machine that matches the board matches the shape,
+ * not only the fastest run the other pages report.
+ */
+#define COL_SP_MIN 98
+#define COL_SP_MED 140
+#define COL_SP_MAX 182
+#define COL_SP_HIST 230
+#define SP_BAR_PITCH 10
+#define SP_BAR_WIDTH 8
+#define SP_BAR_HEIGHT 20
+#define ROW_SP_HDR 32
+#define ROW_SP 46
+#define ROW_SP_PITCH 28
+
+static void draw_spread(void)
+{
+    draw_page_head("KILLER INSTINCT - TIMING SPREAD", "64 runs of each kernel, cycles per op");
+
+    set_text_color(COLOR_HEADER, 0xAAAA);
+    print_xy(COL_KV_L_NAME, ROW_SP_HDR, "Kernel");
+    print_xy(COL_SP_MIN, ROW_SP_HDR, "   min");
+    print_xy(COL_SP_MED, ROW_SP_HDR, "   med");
+    print_xy(COL_SP_MAX, ROW_SP_HDR, "   max");
+    print_xy(COL_SP_HIST, ROW_SP_HDR, "min..max");
+
+    for (uint8_t i = 0; i < TM_SPREAD_COUNT; i++)
+    {
+        const uint16_t y = (uint16_t)(ROW_SP + i * ROW_SP_PITCH);
+        const tm_spread_t *const sp = &tm.spread[i];
+
+        set_text_color(COLOR_NOTE, 0xAAAA);
+        print_xy(COL_KV_L_NAME, y, tm_spread_names[i]);
+
+        if (!tm.spread_done)
+        {
+            print_result(COL_SP_MIN, y, RESULT_PENDING);
+            continue;
+        }
+        print_result(COL_SP_MIN, y, sp->min);
+        print_result(COL_SP_MED, y, sp->med);
+        print_result(COL_SP_MAX, y, sp->max);
+
+        const uint16_t base = (uint16_t)(y + SP_BAR_HEIGHT - 4);
+        draw_horizontal_line(COL_SP_HIST, base + 1, TM_SPREAD_BUCKETS * SP_BAR_PITCH, COLOR_RULE);
+        for (uint8_t b = 0; b < TM_SPREAD_BUCKETS; b++)
+        {
+            if (sp->hist[b] == 0)
+            {
+                continue;
+            }
+            uint16_t h = (uint16_t)((sp->hist[b] * SP_BAR_HEIGHT) / 64u);
+            if (h == 0)
+            {
+                h = 1;
+            }
+            const uint16_t x = (uint16_t)(COL_SP_HIST + b * SP_BAR_PITCH);
+            set_text_color(COLOR_VALUE, COLOR_VALUE);
+            draw_box(x, base - h + 1, x + SP_BAR_WIDTH - 1, base);
+        }
+    }
+
+    draw_horizontal_line(COL_REGION, ROW_RULE_NOTES, 296, COLOR_RULE);
+    set_text_color(COLOR_NOTE, 0xAAAA);
+    print_xy(COL_REGION, ROW_NOTES, "one bar = an eighth of min..max; height = runs");
 }
 
 /*
@@ -1629,6 +1888,10 @@ static void draw_status(void)
     {
         name = "heavy frame";
     }
+    else if (step < STEP_CPUTEST)
+    {
+        name = timing_step_name((uint8_t)(step - STEP_TIMING));
+    }
     else if (step == STEP_CPUTEST)
     {
         name = "CPU tests";
@@ -1709,6 +1972,7 @@ static void reset_results(void)
     vsync_hz = RESULT_PENDING;
     ide_mbps = RESULT_PENDING;
     ide_status = BENCH_IDE_OK;
+    timing_reset();
     step = 0;
 }
 
@@ -1722,29 +1986,41 @@ static void render(const uint64_t frame_count)
 
     video_clear_framebuffer(0x0);
 
-    if (page == 0)
+    switch (page)
     {
+    case PAGE_BANDWIDTH:
         draw_header();
         draw_table();
-        draw_ide();
-        draw_cpu();
+        draw_memory_timing();
         draw_notes();
-    }
-    else if (page == 1)
-    {
+        break;
+    case PAGE_SWEEP:
         draw_sweep();
-    }
-    else if (page == 2)
-    {
+        break;
+    case PAGE_LATENCY:
         draw_latency();
-    }
-    else if (page == 3)
-    {
+        break;
+    case PAGE_CACHES:
+        draw_caches();
+        break;
+    case PAGE_INTEGER:
+        draw_integer();
+        break;
+    case PAGE_FPU:
+        draw_fpu();
+        break;
+    case PAGE_SYSTEM:
+        draw_system();
+        break;
+    case PAGE_HEAVY:
         draw_heavy();
-    }
-    else
-    {
+        break;
+    case PAGE_SPREAD:
+        draw_spread();
+        break;
+    default:
         draw_cputest((uint16_t)(page - PAGE_CPUTEST));
+        break;
     }
 
     draw_status();

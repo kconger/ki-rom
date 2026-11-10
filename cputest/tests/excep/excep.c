@@ -429,14 +429,16 @@ __asm__(
     "    .text\n");
 
 /*
- * Run `n` words of code at UM_VA with KSU = `ksu` and CU0 as given; the code
- * must end in a syscall. Returns with Kernel mode, Status, the TLB entry and
- * the exception hook all put back.
+ * Run `n` words of code at `va` (8 KB aligned), mapped to the scratch page at
+ * `page_off`, with KSU = `ksu` and CU0 as given; the code must end in a
+ * syscall. Returns with Kernel mode, Status, the TLB entry and the exception
+ * hook all put back.
  */
-static void run_unprivileged(const u32 *code, unsigned n, u32 ksu, u32 cu0)
+static void run_unprivileged_at(u64 va, u32 page_off, const u32 *code, unsigned n,
+                                u32 ksu, u32 cu0)
 {
-    volatile u32 *page = (volatile u32 *)_scratch_start;
-    u64 phys = (u64)((u32)(unsigned long)_scratch_start & 0x1FFFFFFFu);
+    volatile u32 *page = (volatile u32 *)(_scratch_start + page_off);
+    u64 phys = (u64)((u32)(unsigned long)_scratch_start & 0x1FFFFFFFu) + page_off;
     u64 saved_hi = cp0_entryhi();
     u32 saved_pm = cp0_pagemask();
     u32 saved_status = cp0_status();
@@ -449,7 +451,7 @@ static void run_unprivileged(const u32 *code, unsigned n, u32 ksu, u32 cu0)
 
     cp0_index_set(UM_TLB_INDEX);
     cp0_pagemask_set(PM_4K);
-    cp0_entryhi_set(UM_VA);
+    cp0_entryhi_set(va);
     cp0_entrylo0_set(((phys >> 12) << ELO_PFN_SHIFT) |
                      ((u64)CA_CACHEABLE_NC << ELO_C_SHIFT) | ELO_V | ELO_D | ELO_G);
     cp0_entrylo1_set(0);
@@ -457,7 +459,7 @@ static void run_unprivileged(const u32 *code, unsigned n, u32 ksu, u32 cu0)
     /* The same physical line through the mapping, so no instruction cached
      * from an earlier use of the scratch page survives into this one. */
     icache_invalidate_range(page, n * 4);
-    icache_invalidate_range(SEXT_PTR((u32)UM_VA), n * 4);
+    icache_invalidate_range(SEXT_PTR((u32)va), n * 4);
 
     um_state.faults = 0;
     um_state.first_cause = 0;
@@ -475,15 +477,13 @@ static void run_unprivileged(const u32 *code, unsigned n, u32 ksu, u32 cu0)
         "nop; nop; nop\n\t"
         "mtc0   %1, $12\n\t"               /* KSU and CU0, EXL kept */
         "nop; nop; nop\n\t"
-        "daddiu $10, $zero, 0x40\n\t"
-        "dsll   $10, $10, 16\n\t"          /* UM_VA = 0x00400000 */
-        "dmtc0  $10, $14\n\t"
+        "dmtc0  %2, $14\n\t"
         "nop; nop; nop\n\t"
         "eret\n\t"
         "nop\n\t"
         "1:" Z
-        :: "r"(&um_state), "r"(status)
-        : "$2", "$8", "$9", "$10", "memory");
+        :: "r"(&um_state), "r"(status), "r"(va)
+        : "$2", "$8", "$9", "memory");
 
     exc_user_handler = 0;
     cp0_status_set(saved_status);
@@ -498,16 +498,67 @@ static void run_unprivileged(const u32 *code, unsigned n, u32 ksu, u32 cu0)
     cp0_pagemask_set(saved_pm);
 }
 
+static void run_unprivileged(const u32 *code, unsigned n, u32 ksu, u32 cu0)
+{
+    run_unprivileged_at(UM_VA, 0, code, n, ksu, cu0);
+}
+
 #define UM_SYSCALL  0x0000000Cu            /* syscall                */
+#define UM_BREAK    0x0000000Du            /* break                  */
 #define UM_MFC0_SR  0x40026000u            /* mfc0 $2, $12 (Status)  */
 #define UM_TLBP     0x42000008u            /* tlbp                   */
 #define UM_NOP      0x00000000u
+
+/*
+ * Does a User-mode fetch go through the TLB? Every test that leaves Kernel
+ * mode runs its code at a TLB-mapped kuseg address. A core built to fetch only
+ * from KSEG0/KSEG1 (INSTR_KSEG_ONLY) reads the unmapped physical address
+ * instead and runs whatever is there; if none of that raises an exception
+ * (a core built without address errors) it never comes back, so those
+ * tests check this first and fail without running. The probe's VA
+ * is the physical address of a scratch page holding break; syscall, and the
+ * TLB maps it to another holding syscall, so both outcomes end in a syscall:
+ *   through the TLB   Sys, no fault on the way
+ *   bypassing it      Bp, then Sys
+ */
+#define UF_P_IDENT  0xC000u                /* read when the TLB is bypassed */
+#define UF_P_MAPPED 0x10000u               /* what the TLB maps the VA to   */
+
+int user_fetch_mapped(void)
+{
+    static int state = -1;
+
+    if (state < 0) {
+        static const u32 sys[] = { UM_SYSCALL, UM_NOP };
+        volatile u32 *ident = (volatile u32 *)(_scratch_start + UF_P_IDENT);
+        u64 va = (u64)((u32)(unsigned long)_scratch_start & 0x1FFFFFFFu) + UF_P_IDENT;
+
+        ident[0] = UM_BREAK;
+        ident[1] = UM_SYSCALL;
+        ident[2] = UM_NOP;
+        SYNC();
+        dcache_wb_invalidate_range(ident, 12);
+        icache_invalidate_range(ident, 12);
+        run_unprivileged_at(va, UF_P_MAPPED, sys, 2, ST_KSU_USER, 0);
+        state = um_state.faults == 0;
+    }
+    return state;
+}
+
+static void t_user_fetch_via_tlb(void)
+{
+    CHECK_EQ(user_fetch_mapped(), 1);
+    if (!user_fetch_mapped())
+        con_puts("      [User fetch bypasses the TLB: User-mode tests not run]\n");
+}
 
 static void t_cp0_unusable_outside_kernel(void)
 {
     static const u32 control[] = { UM_SYSCALL, UM_NOP };
     static const u32 mfc0[]    = { UM_MFC0_SR, UM_SYSCALL, UM_NOP };
     static const u32 tlbp[]    = { UM_TLBP, UM_SYSCALL, UM_NOP };
+
+    NEED_USER_FETCH();
 
     /* The control: into User mode and straight back, no fault on the way.
      * Without it a CPU that cannot enter User mode at all would pass the
@@ -539,6 +590,8 @@ static void t_cp0_usable_with_cu0(void)
 {
     static const u32 mfc0[] = { UM_MFC0_SR, UM_SYSCALL, UM_NOP };
 
+    NEED_USER_FETCH();
+
     run_unprivileged(mfc0, 3, ST_KSU_USER, 1);
     CHECK_EQ(um_state.faults, 0u);
     CHECK_EQ(exc.count, 1u);
@@ -561,6 +614,7 @@ static const struct test tests[] = {
     TEST("excep/epc_is_faulting_insn", t_epc_points_at_faulting_instruction, CPU_ALL),
     TEST("excep/exl_preserves_epc",    t_exception_with_exl_set_preserves_epc, CPU_ALL),
     TEST("excep/general_vector",       t_general_vector_used,                CPU_ALL),
+    TEST("excep/user_fetch_via_tlb",   t_user_fetch_via_tlb,                 CPU_ALL),
     TEST("excep/cp0_unusable_user",    t_cp0_unusable_outside_kernel,        CPU_ALL),
     TEST("excep/cp0_usable_cu0",       t_cp0_usable_with_cu0,                CPU_ALL),
 };

@@ -93,6 +93,13 @@ void show_progress(const char *name)
 /* The doubleword of the log being filled, as written so far. */
 static u64 log_word;
 
+static int at_line_start = 1;
+
+int con_at_line_start(void)
+{
+    return at_line_start;
+}
+
 void con_putc(int c)
 {
     u32 n = STATUS->log_len;
@@ -106,6 +113,7 @@ void con_putc(int c)
         LOG[n >> 3] = log_word;
         STATUS->log_len = n + 1;
     }
+    at_line_start = c == '\n';
     if (c == '\n') wdt_kick();
 }
 

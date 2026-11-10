@@ -44,6 +44,8 @@ static inline int has_mips4(void) { return cpu_kind == CPU_R5000; }
 /* ── Console ──────────────────────────────────────────────────────────────── */
 void con_init(void);
 void con_putc(int c);
+/* Whether the last character printed was a newline (or nothing has been). */
+int con_at_line_start(void);
 void con_puts(const char *s);
 void con_hex32(u32 v);
 void con_hex64(u64 v);

@@ -137,6 +137,13 @@ void dcache_invalidate_range(volatile void *addr, u32 len)
 /* Failures print under the test's own name, which the runner has already
  * emitted without a newline — so the first failure closes that line. */
 static int line_open;   /* runner set: the "name ...." line is still open */
+void test_not_run(const char *why)
+{
+    n_fail++;
+    cur_test_fails++;
+    if (line_open) { con_puts("FAIL\n"); line_open = 0; }
+    con_printf("  not run: %s\n", why);
+}
 
 void fail_begin(const char *file, int line, const char *expr)
 {
@@ -305,6 +312,9 @@ u32 suite_main(void)
             n_tests_run++;
             if (cur_test_fails != 0) STATUS->n_tests_failed++;
             if (cur_test_fails == 0 && line_open) con_puts("PASS\n");
+            /* A failed test that printed a note after its checks leaves that
+             * note's line open; the next test's name must not run onto it. */
+            else if (!con_at_line_start()) con_putc('\n');
             line_open = 0;
             STATUS->n_pass = n_pass;
             STATUS->n_fail = n_fail;

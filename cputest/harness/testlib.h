@@ -18,6 +18,16 @@ void fail_begin(const char *file, int line, const char *expr);
 void fail_u64(const char *what, u64 got, u64 want);
 void fail_end(void);
 
+/* Called by a test before any check: the test cannot run on this CPU, for
+ * the reason given. It counts as run and failed, with one failed check. */
+void test_not_run(const char *why);
+
+/* Whether User-mode code is fetched through the TLB (tests/excep/excep.c).
+ * The tests that run code in User mode need it, and fail without it. */
+int user_fetch_mapped(void);
+#define NEED_USER_FETCH()                                                  \
+    do { if (!user_fetch_mapped()) { test_not_run("needs User fetch through the TLB"); return; } } while (0)
+
 /* ── CHECK macros ─────────────────────────────────────────────────────────── */
 /* Every check counts; a failure prints one indented line under the test name
  * and lets the test continue, so one broken instruction doesn't hide the rest. */

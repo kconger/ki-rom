@@ -563,3 +563,32 @@ Large data runs once and goes after all code (the CPU test image is in its own
 `.cputest` section). After every memtest link, `tools/check_icache.py` reads
 the ELF's symbols, and the build fails if any kernel line shares an index with
 another line of the block, or if a measurement function has left the block.
+
+## Memory test pages
+
+One topic a page; left or up steps back, any other button forward.
+
+| Page | What it measures |
+| ---- | ---------------- |
+| Memory bandwidth | MB/s per region, cached and uncached; uncached store cost per width (sb/sh/sw/sd); uncached loads inside vblank and mid-frame (scanout contention) |
+| SRAM map | uncached read speed every 16 KiB across the 512 KiB |
+| Memory latency | pointer chase, stride sweep, bank pair, write allocate |
+| Caches and TLB | D-cache hits, set conflicts and replacement, cache operations; I-cache set conflicts, DRAM refill, uncached EPROM; mapped loads over 1-16 TLB pages |
+| CPU integer | ALU, multiply and divide rates; mult/div latency to mflo/mfhi; branches; load-use, unaligned loads, store-to-load; sync, mfc0 |
+| CPU floating point | add/mul/div/sqrt latency (s and d), conversions, moves, compare-branch, mtc1/mfc1, lwc1-use, throughput |
+| System and I/O | frame and vblank length; Compare and vblank interrupt latency; syscall round trip; I/O register reads; IDE read rate; DCS command acknowledge and boot time |
+| Heavy frame | KI2's barrel-explosion sprite blend |
+| Timing spread | 64 runs each of five kernels: min, median, max and a histogram |
+| CPU tests | the iris suite |
+
+timing.c's kernels are generated into DRAM at run time (0x08140000 up,
+each in a slot of its own) rather than linked into the measurement block
+above. A fresh address per kernel also keeps MAME's recompiler, which does
+not notice rewritten code, from running an older kernel's translation. Each runs its loop once untimed,
+which loads its lines into both caches, and reads Count around the timed run
+itself, so nothing else runs inside the window and where the ROM's own code
+sits in the I-cache does not matter. The code is written through KSEG0 and
+written back: an uncached store narrower than 64 bits would zero the rest of
+its doubleword on the board. The interrupt and syscall tests install a handler
+at 0x80000180 with Status.BEV clear for their duration; anything other than
+the expected interrupt or syscall goes on to the ROM's own vector.
